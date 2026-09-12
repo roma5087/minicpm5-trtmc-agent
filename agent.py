@@ -109,7 +109,11 @@ def run_agent(
         if verbose:
             print(f"\n--- turn {turn}: model output ---\n{raw_output}")
 
-        messages.append({"role": "assistant", "content": raw_output})
+        # Strip <think> before persisting to history: MiniCPM5's template only
+        # needs the current turn's thinking, not every prior turn's -- storing
+        # it verbatim would let it compound and re-expand into the prompt on
+        # every subsequent render across a long multi-turn run.
+        messages.append({"role": "assistant", "content": strip_thinking(raw_output)})
         calls = parse_tool_calls(raw_output)
         if not calls:
             return strip_thinking(raw_output).strip(), perf
@@ -122,8 +126,15 @@ def run_agent(
             else:
                 try:
                     result = impl(**call["arguments"])
-                except TypeError as error:
-                    result = f"error: bad arguments for {call['name']}: {error}"
+                except Exception as error:
+                    # Defense in depth: every tool in tools.py is written to
+                    # catch its own failures and return an "error: ..."
+                    # string, never raise -- but the safety net below only
+                    # works if that discipline holds for every tool, present
+                    # and future, so an unexpected exception here is also
+                    # turned into a normal (recoverable) tool-response error
+                    # instead of crashing the whole agent process.
+                    result = f"error: {call['name']} raised {type(error).__name__}: {error}"
             if isinstance(result, str) and result.startswith("error:"):
                 turn_had_error = True
             if verbose:
