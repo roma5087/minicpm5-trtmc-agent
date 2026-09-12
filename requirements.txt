@@ -1,0 +1,2 @@
+transformers>=4.45
+ddgs>=9.0
