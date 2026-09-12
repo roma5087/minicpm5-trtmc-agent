@@ -106,7 +106,7 @@ _ALLOWED_COMPAREOPS = {
 
 
 def _eval_node(node: ast.AST) -> float | bool:
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
         return _ALLOWED_BINOPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
@@ -120,13 +120,21 @@ def _eval_node(node: ast.AST) -> float | bool:
 
 
 def calculator(expression: str) -> str:
-    """Safely evaluate arithmetic (and simple comparisons) without eval()."""
+    """Safely evaluate arithmetic (and simple comparisons) without eval().
+
+    str(result) is inside the try too: a huge exponent (e.g. 10**200000)
+    evaluates fine but raises on int-to-str conversion (Python's own
+    integer-string-conversion limit), which must not escape as an
+    uncaught exception -- every tool must return an "error: ..." string
+    on failure, never raise, since the agent loop's safety net only
+    recognizes failures that come back that way.
+    """
     try:
         tree = ast.parse(expression, mode="eval")
         result = _eval_node(tree.body)
+        return str(result)
     except Exception as error:
         return f"error: could not evaluate {expression!r}: {error}"
-    return str(result)
 
 
 def web_search(query: str, max_results: int = 4) -> str:
@@ -147,7 +155,10 @@ def web_search(query: str, max_results: int = 4) -> str:
 
 def _resolve_in_workspace(filename: str) -> Path:
     candidate = (WORKSPACE / filename).resolve()
-    if WORKSPACE not in candidate.parents and candidate != WORKSPACE:
+    # candidate == WORKSPACE (e.g. filename="." or "") is rejected too: a
+    # tool call must always name a file *within* the workspace, never the
+    # workspace directory itself (writing to it raises IsADirectoryError).
+    if candidate == WORKSPACE or WORKSPACE not in candidate.parents:
         raise ValueError(f"path escapes workspace: {filename!r}")
     return candidate
 
@@ -155,20 +166,20 @@ def _resolve_in_workspace(filename: str) -> Path:
 def write_file(filename: str, content: str) -> str:
     try:
         path = _resolve_in_workspace(filename)
-    except ValueError as error:
+        path.write_text(content, encoding="utf-8")
+    except (ValueError, OSError) as error:
         return f"error: {error}"
-    path.write_text(content, encoding="utf-8")
     return f"saved {len(content)} bytes to {path.name}"
 
 
 def read_file(filename: str) -> str:
     try:
         path = _resolve_in_workspace(filename)
-    except ValueError as error:
+        if not path.is_file():
+            return f"error: {filename!r} does not exist in workspace"
+        return path.read_text(encoding="utf-8")
+    except (ValueError, OSError) as error:
         return f"error: {error}"
-    if not path.is_file():
-        return f"error: {filename!r} does not exist in workspace"
-    return path.read_text(encoding="utf-8")
 
 
 TOOL_IMPLEMENTATIONS = {

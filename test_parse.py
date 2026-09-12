@@ -50,3 +50,46 @@ def test_multiple_function_calls_in_one_turn():
 def test_strip_thinking_removes_think_block_only():
     text = "<think>internal reasoning</think>the actual answer"
     assert strip_thinking(text) == "the actual answer"
+
+
+def test_cdata_value_containing_literal_closing_param_tag_not_truncated():
+    # A value that itself contains the literal text "</param>" must not be
+    # cut short by a naive "find the next </param>" scan -- the CDATA
+    # boundary (]]>) is the real end of the value, not that substring.
+    text = (
+        '<function name="write_file">'
+        '<param name="filename">report.txt</param>'
+        '<param name="content"><![CDATA[before </param> after]]></param>'
+        "</function>"
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0]["arguments"]["content"] == "before </param> after"
+
+
+def test_overlapping_function_tags_do_not_silently_merge():
+    # A hallucinated second <function> opening before the first one's
+    # </function> must not be silently merged into one call with foreign
+    # arguments -- the malformed block should just be dropped, not guessed.
+    text = (
+        '<function name="a"><param name="x">1</param>'
+        '<function name="b"><param name="y">2</param></function></function>'
+    )
+    calls = parse_tool_calls(text)
+    # Neither call should come out looking like a valid merged call with
+    # both x and y as arguments to "a".
+    assert not any(c["name"] == "a" and "y" in c["arguments"] for c in calls)
+
+
+def test_malformed_function_block_is_dropped_not_guessed():
+    text = '<function name="broken"><param name="x">no closing param tag'
+    assert parse_tool_calls(text) == []
+
+
+def test_well_formed_call_still_parses_after_a_malformed_one():
+    text = (
+        '<function name="broken"><param name="x">no closing param tag'
+        '<function name="ok"><param name="y">1</param></function>'
+    )
+    calls = parse_tool_calls(text)
+    assert any(c["name"] == "ok" and c["arguments"] == {"y": "1"} for c in calls)

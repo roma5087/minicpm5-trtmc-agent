@@ -42,7 +42,14 @@ calling is implemented entirely in Python, not inside `trtmc` itself:
   so this sidesteps that path entirely.
 - **`parse.py`** -- extracts MiniCPM5's `<function name="..."><param
   name="...">value</param></function>` tool-call XML from the model's raw
-  output text.
+  output text. A position-based scanner, not a single whole-string regex --
+  a greedy/non-greedy regex would either silently truncate a CDATA-wrapped
+  value containing a literal `</param>`, or silently *merge* two overlapping
+  hallucinated `<function>` blocks into one call with foreign arguments. Both
+  failure modes are worse than raising, since the caller would then execute a
+  corrupted action with no signal anything went wrong. This scanner instead
+  parses each call strictly outward from its own opening tag and drops (never
+  guesses at) a block that turns out malformed partway through.
 - **`tools.py`** -- the actual tool implementations (`web_search`,
   `calculator`, `write_file`, `read_file`) and their JSON-schema definitions.
   `calculator` supports arithmetic and comparisons (`<`, `<=`, `==`, ...) via
@@ -54,11 +61,22 @@ calling is implemented entirely in Python, not inside `trtmc` itself:
   until the model returns a plain answer, capped at `MAX_TURNS`. A tool
   error is fed back to the model as a normal turn (so it can retry/reformulate
   on its own), with a `MAX_CONSECUTIVE_TOOL_ERRORS` cap so a genuinely stuck
-  tool can't silently burn every remaining turn.
+  tool can't silently burn every remaining turn (any tool call failing within
+  a turn counts that whole turn as an error turn; a turn where every call
+  succeeds resets the counter). Each turn's assistant output is stripped of
+  its `<think>...</think>` block before being stored in history -- MiniCPM5's
+  own template re-renders the full history back into the next prompt, so an
+  unstripped `<think>` block would compound turn over turn.
 - **`precision_compare.py`** -- a standalone script that runs the identical
   prompt through two pre-built bundles of the same checkpoint (one bf16, one
   fp16) and reports measured `prefill_ms`/`decode_ms`/ms-per-token for each --
-  a real comparison, not a claim.
+  a real comparison, not a claim. Renders the prompt via `render.py`'s own
+  chat-template path (the same one `agent.py` uses), not `trtmc run
+  --use-chat-template true`, for the same template-fidelity reason as above --
+  a precision comparison built on the distrusted path could end up measuring
+  a different prompt structure per precision, silently confounding the
+  comparison. Discards the first invocation per precision as a warmup run
+  (unless `--repeats 1`) and reports a standard deviation across the rest.
 
 ## Results
 
@@ -114,8 +132,15 @@ python precision_compare.py \
 ## Status
 
 Code complete, including a consecutive-tool-error safety cap and real
-per-turn performance accounting. Non-GPU-dependent parts (`parse.py`,
-`tools.py`, `agent.py`'s orchestration logic) are covered by
-`test_parse.py`/`test_tools.py`/`test_agent.py` (17 tests, all passing
-locally). Full agent-loop and `precision_compare.py` runs against a real
+per-turn performance accounting. Reviewed by three independent fresh-context
+passes acting as NVIDIA senior AI SWEs (correctness, test coverage,
+portfolio/interview readiness); the correctness and coverage passes each
+reproduced concrete bugs -- an uncaught crash in the calculator on results
+too large to `str()`, file-tool I/O calls that ran outside their own
+try/except, a tool-call parser that could silently truncate or merge
+malformed output, and unstripped `<think>` blocks compounding across turns --
+all fixed and covered by regression tests. Non-GPU-dependent parts
+(`parse.py`, `tools.py`, `agent.py`'s orchestration logic, `render.py`,
+`precision_compare.py`'s own arithmetic) are covered by 39 tests, all passing
+locally. Full agent-loop and `precision_compare.py` runs against a real
 compiled bundle are pending a GPU session.
