@@ -36,13 +36,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "calculator",
-            "description": "Evaluate a basic arithmetic expression (+, -, *, /, **, parentheses).",
+            "description": "Evaluate an arithmetic expression (+, -, *, /, **, parentheses) or a single comparison (<, <=, >, >=, ==, !=) between two numbers/expressions.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "expression": {
                         "type": "string",
-                        "description": "An arithmetic expression, e.g. '150 * 3.7'.",
+                        "description": "An expression, e.g. '150 * 3.7' or '4200 <= 5000'.",
                     },
                 },
                 "required": ["expression"],
@@ -93,20 +93,34 @@ _ALLOWED_UNARYOPS = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
+# Comparisons let the agent explicitly check constraints (e.g. "is this price
+# within budget?") instead of silently eyeballing numbers in its own text.
+_ALLOWED_COMPAREOPS = {
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+}
 
 
-def _eval_node(node: ast.AST) -> float:
+def _eval_node(node: ast.AST) -> float | bool:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
         return _ALLOWED_BINOPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
         return _ALLOWED_UNARYOPS[type(node.op)](_eval_node(node.operand))
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _ALLOWED_COMPAREOPS:
+        left = _eval_node(node.left)
+        right = _eval_node(node.comparators[0])
+        return _ALLOWED_COMPAREOPS[type(node.ops[0])](left, right)
     raise ValueError(f"disallowed expression element: {ast.dump(node)}")
 
 
 def calculator(expression: str) -> str:
-    """Safely evaluate arithmetic without falling back to eval()."""
+    """Safely evaluate arithmetic (and simple comparisons) without eval()."""
     try:
         tree = ast.parse(expression, mode="eval")
         result = _eval_node(tree.body)

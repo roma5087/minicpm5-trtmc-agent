@@ -8,6 +8,12 @@ def test_calculator_basic_arithmetic():
     assert calculator("150 * 3.7") == "555.0"
 
 
+def test_calculator_supports_comparisons():
+    assert calculator("4200 <= 5000") == "True"
+    assert calculator("4200 * 2 <= 5000") == "False"
+    assert calculator("10 == 10") == "True"
+
+
 def test_calculator_rejects_non_arithmetic():
     result = calculator("__import__('os').system('echo pwned')")
     assert result.startswith("error:")
