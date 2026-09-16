@@ -120,16 +120,39 @@ def run_agent(
     include_example: bool = False,
 ) -> tuple[str, PerfSummary]:
     tokenizer = load_tokenizer(model_dir)
+    # Resolved once: used to strip a trailing turn-end marker at the token-id
+    # level (see below) rather than by matching the decoded string's suffix,
+    # which a trailing newline/whitespace after the token would silently
+    # defeat.
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     messages = [{"role": "system", "content": "You are a helpful assistant with access to tools."}]
     if include_example:
-        messages.extend(ONE_SHOT_EXAMPLE)
+        # Copied, not referenced: ONE_SHOT_EXAMPLE is a shared module-level
+        # list reused across every run_agent() call in the same process --
+        # nothing here mutates a message dict in place today, but extending
+        # by reference would silently corrupt it across calls the moment
+        # something does.
+        messages.extend(dict(m) for m in ONE_SHOT_EXAMPLE)
     messages.append({"role": "user", "content": task})
     perf = PerfSummary()
     consecutive_tool_errors = 0
 
     for turn in range(1, MAX_TURNS + 1):
         prompt = render_prompt(tokenizer, messages, TOOL_SCHEMAS)
-        payload = run_trtmc(binary, bundle, runtime_root, prompt, max_new_tokens)
+        try:
+            payload = run_trtmc(binary, bundle, runtime_root, prompt, max_new_tokens)
+            token_ids = payload["token_ids"]
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+            KeyError,
+        ) as error:
+            # trtmc itself failing (crash, timeout, malformed output) isn't
+            # something another model turn can reformulate around -- unlike
+            # a tool error, there's nothing to feed back and retry against,
+            # so stop now with a clear error rather than loop or crash raw.
+            return f"error: trtmc invocation failed: {type(error).__name__}: {error}", perf
         # Decode token_ids ourselves rather than trust payload["text"]: trtmc's
         # native detokenizer silently drops MiniCPM5's added special tokens
         # (verified directly -- token ids 18/20/21/19 decode via the real HF
@@ -137,12 +160,9 @@ def run_agent(
         # "text" field omits all four). The model has been emitting well-formed
         # tool calls the whole time; only trtmc's own text rendering was wrong.
         # See README "Results" for the full diagnostic.
-        raw_output = tokenizer.decode(payload["token_ids"])
-        # The turn-end marker is a template artifact, not content -- strip it
-        # the same way trtmc's own (buggy) text field implicitly did, so
-        # switching to our own decode doesn't leak it into answers/history.
-        if raw_output.endswith("<|im_end|>"):
-            raw_output = raw_output[: -len("<|im_end|>")]
+        if token_ids and token_ids[-1] == im_end_id:
+            token_ids = token_ids[:-1]
+        raw_output = tokenizer.decode(token_ids)
         perf.record(payload, len(payload.get("token_ids", [])))
         if verbose:
             print(f"\n--- turn {turn}: model output ---\n{raw_output}")

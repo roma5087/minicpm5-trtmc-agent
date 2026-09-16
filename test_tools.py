@@ -1,6 +1,55 @@
 import pytest
 
-from tools import WORKSPACE, calculator, read_file, write_file
+from tools import WORKSPACE, calculator, read_file, web_search, write_file
+
+
+class _FakeDDGS:
+    """Stand-in for ddgs.DDGS -- a context manager whose .text() either
+    returns canned results or whose __enter__ raises, to exercise
+    web_search()'s formatting and error-handling paths without a real
+    network call."""
+
+    def __init__(self, results=None, error=None):
+        self._results = results or []
+        self._error = error
+
+    def __enter__(self):
+        if self._error is not None:
+            raise self._error
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def text(self, query, max_results=4):
+        return self._results
+
+
+def test_web_search_formats_title_and_body_from_each_result(monkeypatch):
+    monkeypatch.setattr(
+        "tools.DDGS",
+        lambda: _FakeDDGS(
+            [
+                {"title": "NVIDIA A40", "body": "48GB VRAM workstation GPU"},
+                {"title": "NVIDIA L40S", "body": "Ada Lovelace architecture"},
+            ]
+        ),
+    )
+    result = web_search("NVIDIA A40 vs L40S")
+    assert result == (
+        "- NVIDIA A40: 48GB VRAM workstation GPU\n"
+        "- NVIDIA L40S: Ada Lovelace architecture"
+    )
+
+
+def test_web_search_reports_errors_instead_of_crashing(monkeypatch):
+    # web_search is a tool: like every other tool, a failure (network
+    # error, DDGS internals raising, etc.) must come back as an
+    # "error: ..." string, never an uncaught exception, or the agent's
+    # safety net never sees it and the process crashes mid-run.
+    monkeypatch.setattr("tools.DDGS", lambda: _FakeDDGS(error=RuntimeError("network down")))
+    result = web_search("anything")
+    assert result.startswith("error:")
 
 
 def test_calculator_basic_arithmetic():
@@ -28,6 +77,22 @@ def test_calculator_huge_result_returns_error_not_crash():
     # only recognizes failures that come back that way.
     result = calculator("10**200000")
     assert result.startswith("error:")
+
+
+def test_calculator_rejects_exponent_before_computing_it():
+    # The exponent magnitude is checked *before* pow() runs, not just after
+    # via the int-to-str guard above -- a huge exponent must be rejected
+    # cheaply rather than actually computed (a real DoS surface: computing
+    # e.g. 99**99999999 is expensive in itself, independent of whether its
+    # result would ever reach str()).
+    result = calculator("2**999999999999")
+    assert result.startswith("error:")
+
+
+def test_calculator_still_allows_reasonably_large_exponents():
+    # The guard must not be so tight it breaks ordinary arithmetic a real
+    # comparison task would use.
+    assert calculator("2**10") == "1024"
 
 
 def test_calculator_rejects_non_arithmetic():

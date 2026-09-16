@@ -29,8 +29,12 @@ rather than just claiming it works.
 > VRAM. Using approximate list prices of $5,500 for the A40, $8,600 for the
 > L40S, and $6,800 for the RTX 6000 Ada, use the calculator to compute FP16
 > TFLOPS per dollar for each. Then use the calculator again to directly check
-> which ratio is greatest ... rather than judging by eye. Save the comparison
-> to a file, including the recommendation and why."
+> which ratio is greatest (e.g. a '>' comparison between two of the ratios at
+> a time) rather than judging by eye, since the highest ratio is the one to
+> recommend. Save the comparison to a file, including the recommendation and
+> why."
+
+(Verbatim `DEFAULT_TASK` in `agent.py` -- not paraphrased.)
 
 Deliberately not a single linear tool chain: it requires researching three
 separate entities, running a calculation per entity, comparing the results,
@@ -253,6 +257,7 @@ python agent.py \
 
 ```bash
 python precision_compare.py \
+  --model-dir /path/to/MiniCPM5-2B \
   --binary /path/to/trtmc \
   --runtime-root /path/to/build-output-dir \
   --bf16-bundle /path/to/minicpm5-2b-bf16.bundle \
@@ -297,13 +302,27 @@ python precision_compare.py \
 **The agent completes its full task end-to-end on real GPU hardware and
 gives a correct, verified recommendation** -- see Results above for the full
 run and the two real bugs (one in `trtmc`, one in the model's numeric
-synthesis) that had to be found and fixed to get there. Code is also
-reviewed by three independent fresh-context passes (correctness, test coverage, documentation accuracy); the
-correctness and coverage passes reproduced concrete bugs -- an uncaught
+synthesis) that had to be found and fixed to get there. Code has been
+through two independent multi-reviewer rounds (three fresh-context passes
+each). Round one (correctness, test
+coverage, documentation accuracy) reproduced concrete bugs -- an uncaught
 crash in the calculator on results too large to `str()`, file-tool I/O calls
 that ran outside their own try/except, a tool-call parser that could
 silently truncate or merge malformed output, and unstripped `<think>` blocks
-compounding across turns -- all fixed and covered by regression tests.
-Non-GPU-dependent parts (`parse.py`, `tools.py`, `agent.py`'s orchestration
-logic, `render.py`, `precision_compare.py`'s own arithmetic) are covered by
-42 tests, all passing locally.
+compounding across turns. Round two, after the `trtmc`-detokenizer fix
+landed, found: no error handling around the per-turn `trtmc` call/decode
+path (an infrastructure failure -- a crash, timeout, or malformed payload --
+would have taken down the whole process uncaught); a real contract gap
+between `tools.py`'s calculator schema (which advertises unwrapped `<=`/`<`
+comparisons) and `parse.py`'s CDATA requirement for any value containing a
+literal `<` (an unwrapped comparison was silently dropped, not evaluated);
+a fragile string-suffix match for the `<|im_end|>` turn marker instead of a
+token-id-level strip; an unbounded-exponent cost in the calculator evaluated
+before the existing result-size guard ever ran; and a shared-by-reference
+one-shot example list. All fixed (verified against real GPU hardware after
+the fix, not just locally) and covered by regression tests; also caught and
+fixed in this round: a stale `precision_compare.py` example command missing
+a required flag, and a quoted task string that had silently drifted from
+the actual code. Non-GPU-dependent parts (`parse.py`, `tools.py`, `agent.py`'s
+orchestration logic, `render.py`, `precision_compare.py`'s own arithmetic)
+are covered by 56 tests, all passing locally.

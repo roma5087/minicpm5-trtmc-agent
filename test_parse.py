@@ -86,6 +86,21 @@ def test_malformed_function_block_is_dropped_not_guessed():
     assert parse_tool_calls(text) == []
 
 
+def test_non_cdata_param_value_surrounding_whitespace_is_stripped():
+    # A non-CDATA value is `.strip()`-ed (verbatim preservation is only
+    # guaranteed for CDATA-wrapped values, tested above) -- a template that
+    # pads values with newlines/indentation must not have that whitespace
+    # leak into the tool argument (e.g. "expression": "\n   1 + 1   \n"
+    # would make the calculator choke on a value it should accept).
+    text = (
+        '<function name="calculator">'
+        '<param name="expression">\n   1 + 1   \n</param>'
+        "</function>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls == [{"name": "calculator", "arguments": {"expression": "1 + 1"}}]
+
+
 def test_well_formed_call_still_parses_after_a_malformed_one():
     text = (
         '<function name="broken"><param name="x">no closing param tag'
@@ -93,3 +108,31 @@ def test_well_formed_call_still_parses_after_a_malformed_one():
     )
     calls = parse_tool_calls(text)
     assert any(c["name"] == "ok" and c["arguments"] == {"y": "1"} for c in calls)
+
+
+def test_unwrapped_comparison_value_containing_a_bare_lt_is_dropped_not_parsed():
+    # A value containing a literal "<" (e.g. a "<=" comparison, which
+    # tools.py's calculator schema supports) is NOT safe to leave unwrapped
+    # -- the scanner requires CDATA for any value containing "<", by design
+    # (see parse.py's module docstring on the overlapping-tag merge risk).
+    # This documents that real, load-bearing constraint: the calculator
+    # tool's own schema description now tells the model to CDATA-wrap "<"/
+    # "<=" comparisons specifically because of this -- an unwrapped one is
+    # silently dropped as malformed, not evaluated with a truncated/wrong
+    # expression.
+    text = '<function name="calculator"><param name="expression">4200 <= 5000</param></function>'
+    assert parse_tool_calls(text) == []
+
+
+def test_cdata_wrapped_comparison_value_parses_correctly():
+    # The documented fix for the above: the same "<=" comparison, correctly
+    # CDATA-wrapped as the calculator schema now instructs, must parse to
+    # the exact expression text (unlike the unwrapped case, nothing here is
+    # dropped or mangled).
+    text = (
+        '<function name="calculator">'
+        "<param name=\"expression\"><![CDATA[4200 <= 5000]]></param>"
+        "</function>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls == [{"name": "calculator", "arguments": {"expression": "4200 <= 5000"}}]
