@@ -8,15 +8,25 @@ from pathlib import Path
 import agent
 
 
+class _StubTokenizer:
+    """agent.py decodes token_ids itself now (trtmc's own text field silently
+    drops MiniCPM5's <function>/<param>/</function> special tokens -- see
+    README "Results"). This stub carries the intended text as a one-element
+    token_ids list and unwraps it, so tests keep controlling output via plain
+    strings without needing real token ids."""
+
+    def decode(self, token_ids):
+        return token_ids[0]
+
+
 def _mock_common(monkeypatch):
-    monkeypatch.setattr(agent, "load_tokenizer", lambda model_dir: object())
+    monkeypatch.setattr(agent, "load_tokenizer", lambda model_dir: _StubTokenizer())
     monkeypatch.setattr(agent, "render_prompt", lambda tokenizer, messages, tools: "RENDERED_PROMPT")
 
 
 def _payload(text: str) -> dict:
     return {
-        "text": text,
-        "token_ids": list(range(5)),
+        "token_ids": [text],
         "setup_ms": 0.1,
         "prefill_ms": 10.0,
         "decode_ms": 20.0,
@@ -169,6 +179,68 @@ def test_think_block_stripped_before_entering_history(monkeypatch):
     assistant_messages = [m for m in second_call_messages if m["role"] == "assistant"]
     assert len(assistant_messages) == 1
     assert "<think>" not in assistant_messages[0]["content"]
+
+
+def test_decodes_token_ids_itself_ignoring_any_text_field(monkeypatch):
+    # Regression test for the real bug found on GPU hardware: trtmc's own
+    # "text" field silently drops MiniCPM5's <function>/<param>/</function>
+    # special tokens (verified against the real HF tokenizer decoding the
+    # same token_ids). agent.py must decode token_ids itself and must NOT
+    # read payload["text"] at all -- a payload with no "text" key must still
+    # work, and a wrong/absent "text" value must not affect the outcome.
+    _mock_common(monkeypatch)
+    payload_without_text_field = {
+        "token_ids": ["a well-formed final answer"],
+        "setup_ms": 0.0,
+        "prefill_ms": 1.0,
+        "decode_ms": 1.0,
+    }
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: payload_without_text_field)
+
+    answer, _ = agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="do something", verbose=False,
+    )
+    assert answer == "a well-formed final answer"
+
+
+def test_include_example_prepends_the_one_shot_before_the_real_task(monkeypatch):
+    _mock_common(monkeypatch)
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: _payload("final answer"))
+    captured_messages = []
+    monkeypatch.setattr(
+        agent, "render_prompt",
+        lambda tokenizer, messages, tools: captured_messages.append([dict(m) for m in messages]) or "RENDERED_PROMPT",
+    )
+
+    agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="the real task", verbose=False, include_example=True,
+    )
+    assert captured_messages[0] == [
+        {"role": "system", "content": "You are a helpful assistant with access to tools."},
+        *agent.ONE_SHOT_EXAMPLE,
+        {"role": "user", "content": "the real task"},
+    ]
+
+
+def test_no_example_by_default(monkeypatch):
+    _mock_common(monkeypatch)
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: _payload("final answer"))
+    captured_messages = []
+    monkeypatch.setattr(
+        agent, "render_prompt",
+        lambda tokenizer, messages, tools: captured_messages.append([dict(m) for m in messages]) or "RENDERED_PROMPT",
+    )
+
+    agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="the real task", verbose=False,
+    )
+    assert captured_messages[0] == [
+        {"role": "system", "content": "You are a helpful assistant with access to tools."},
+        {"role": "user", "content": "the real task"},
+    ]
 
 
 def test_recovers_after_one_error_then_succeeds(monkeypatch):
