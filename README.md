@@ -296,6 +296,16 @@ python precision_compare.py \
   around by instructing it to use the calculator's own comparison support
   (`>`) to check pairwise rather than judge visually -- a real, reproducible
   small-model limitation in numeric synthesis, not in tool execution.
+- **`web_search` results are neutralized against known marker substrings
+  (`<|im_end|>`, `<function`, CDATA delimiters, etc.) before being stored
+  in conversation history, but this is pattern-based, not a formal
+  guarantee.** A security review confirmed the underlying mechanism a
+  poisoned search result could exploit -- HF fast tokenizers match
+  registered special tokens as substrings anywhere in text, not just where
+  a template placed them -- but did not have GPU access to validate whether
+  MiniCPM5-2B itself is actually steerable this way end-to-end. Treat the
+  current mitigation as a real fix for the mechanism, not a proven bound on
+  what a sufficiently adversarial search result could still attempt.
 
 ## Status
 
@@ -323,6 +333,35 @@ one-shot example list. All fixed (verified against real GPU hardware after
 the fix, not just locally) and covered by regression tests; also caught and
 fixed in this round: a stale `precision_compare.py` example command missing
 a required flag, and a quoted task string that had silently drifted from
-the actual code. Non-GPU-dependent parts (`parse.py`, `tools.py`, `agent.py`'s
-orchestration logic, `render.py`, `precision_compare.py`'s own arithmetic)
-are covered by 56 tests, all passing locally.
+the actual code.
+
+**Round three** (correctness re-verification, a mutation-testing-style test
+audit, and a dedicated security pass) found and fixed further real issues:
+the round-two `trtmc` error handling still didn't catch a wrong-*shaped*
+payload (valid JSON that's the wrong type, or a `token_ids` field that
+isn't a list -- both crashed uncaught with a `TypeError`); the exponent
+guard bounded only the exponent, not the base, so a small, allowed exponent
+on an enormous base (or a chain of nested `**` calls, each individually
+within the cap) was just as expensive to compute as the huge-exponent case
+it was written to stop -- replaced with a guard that estimates the actual
+result size; `web_search` results were fed into the next turn's prompt
+completely unsanitized, and HF fast tokenizers match registered special
+tokens as substrings anywhere in text, so a poisoned search result could in
+principle inject fake turn boundaries or fake tool-call XML -- `web_search`
+now neutralizes those marker substrings before they ever reach `messages`;
+an oversized `write_file` (read back via `read_file` into a later prompt)
+could grow a rendered prompt past the OS's `ARG_MAX`, crashing the
+subprocess call with an uncaught `OSError` -- `write_file` now caps content
+size, and `agent.py` catches `OSError` too. The path-traversal sandboxing
+was independently re-attacked (symlinks, absolute-path joins, percent- and
+Unicode-encoded traversal, null bytes, oversized filenames) and held in
+every case; `subprocess` shell-injection was independently re-attempted and
+confirmed not exploitable (list-form `subprocess.run`, no `shell=True`).
+Re-verified against real GPU hardware after every fix in this round too --
+byte-identical correct output to the pre-fix run, confirming no regression.
+Non-GPU-dependent parts (`parse.py`, `tools.py`, `agent.py`'s orchestration
+logic, `render.py`, `precision_compare.py`'s own arithmetic) are covered by
+84 tests, all passing locally -- up from 56, including tests added via a
+mutation-testing pass (deliberately introducing small real bugs one at a
+time and confirming the suite actually catches each one, not just that it
+currently passes).

@@ -5,6 +5,7 @@ verbatim, not that any particular template renders a particular way."""
 
 from __future__ import annotations
 
+import render
 from render import render_prompt
 
 
@@ -50,3 +51,23 @@ def test_render_prompt_requests_untokenized_text_with_generation_prompt():
     call = tokenizer.calls[0]
     assert call["tokenize"] is False
     assert call["add_generation_prompt"] is True
+
+
+def test_load_tokenizer_disables_trust_remote_code(monkeypatch):
+    # trust_remote_code=False is a deliberate security choice (no arbitrary
+    # code execution from a model repo's own tokenizer code) -- load_tokenizer()
+    # had zero test coverage before this, so flipping it to True (or
+    # dropping model_dir) would have gone unnoticed.
+    captured = {}
+
+    class _StubAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model_dir, trust_remote_code=None):
+            captured["model_dir"] = model_dir
+            captured["trust_remote_code"] = trust_remote_code
+            return "TOKENIZER"
+
+    monkeypatch.setattr(render, "AutoTokenizer", _StubAutoTokenizer)
+    result = render.load_tokenizer("/some/model/dir")
+    assert result == "TOKENIZER"
+    assert captured == {"model_dir": "/some/model/dir", "trust_remote_code": False}

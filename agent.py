@@ -139,20 +139,6 @@ def run_agent(
 
     for turn in range(1, MAX_TURNS + 1):
         prompt = render_prompt(tokenizer, messages, TOOL_SCHEMAS)
-        try:
-            payload = run_trtmc(binary, bundle, runtime_root, prompt, max_new_tokens)
-            token_ids = payload["token_ids"]
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            json.JSONDecodeError,
-            KeyError,
-        ) as error:
-            # trtmc itself failing (crash, timeout, malformed output) isn't
-            # something another model turn can reformulate around -- unlike
-            # a tool error, there's nothing to feed back and retry against,
-            # so stop now with a clear error rather than loop or crash raw.
-            return f"error: trtmc invocation failed: {type(error).__name__}: {error}", perf
         # Decode token_ids ourselves rather than trust payload["text"]: trtmc's
         # native detokenizer silently drops MiniCPM5's added special tokens
         # (verified directly -- token ids 18/20/21/19 decode via the real HF
@@ -160,9 +146,39 @@ def run_agent(
         # "text" field omits all four). The model has been emitting well-formed
         # tool calls the whole time; only trtmc's own text rendering was wrong.
         # See README "Results" for the full diagnostic.
-        if token_ids and token_ids[-1] == im_end_id:
-            token_ids = token_ids[:-1]
-        raw_output = tokenizer.decode(token_ids)
+        try:
+            payload = run_trtmc(binary, bundle, runtime_root, prompt, max_new_tokens)
+            token_ids = payload["token_ids"]
+            if not isinstance(token_ids, list):
+                # Valid JSON of the wrong shape (a bare list/string/number in
+                # place of the expected dict, or a non-list token_ids field)
+                # would otherwise raise a bare, uncaught TypeError past this
+                # point instead of the clear error below.
+                raise TypeError(f"expected a list for token_ids, got {type(token_ids).__name__}")
+            if token_ids and token_ids[-1] == im_end_id:
+                token_ids = token_ids[:-1]
+            raw_output = tokenizer.decode(token_ids)
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            OSError,
+        ) as error:
+            # OSError specifically covers e.g. "Argument list too long"
+            # (ARG_MAX) from subprocess.run when the rendered prompt itself
+            # is oversized -- confirmed reproducible from a single overly
+            # large write_file/read_file round trip, since nothing else
+            # bounds prompt size across a run. write_file caps its own
+            # input size for this reason, but that's a mitigation, not a
+            # substitute for handling the failure here too.
+            # trtmc itself failing (crash, timeout, malformed/wrong-shaped
+            # output) isn't something another model turn can reformulate
+            # around -- unlike a tool error, there's nothing to feed back
+            # and retry against, so stop now with a clear error rather than
+            # loop or crash raw.
+            return f"error: trtmc invocation failed: {type(error).__name__}: {error}", perf
         perf.record(payload, len(payload.get("token_ids", [])))
         if verbose:
             print(f"\n--- turn {turn}: model output ---\n{raw_output}")
