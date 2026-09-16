@@ -8,15 +8,27 @@ from pathlib import Path
 import agent
 
 
+# A sentinel standing in for the real <|im_end|> token id. agent.py strips
+# the turn-end marker at the token-id level (slicing it off token_ids before
+# ever calling decode()), not by matching a decoded string's suffix -- so
+# tests simulate it by appending this sentinel as the last token_ids entry,
+# not by putting the literal "<|im_end|>" substring in the payload text.
+_IM_END_SENTINEL = "STUB_IM_END_TOKEN_ID"
+
+
 class _StubTokenizer:
     """agent.py decodes token_ids itself now (trtmc's own text field silently
     drops MiniCPM5's <function>/<param>/</function> special tokens -- see
-    README "Results"). This stub carries the intended text as a one-element
-    token_ids list and unwraps it, so tests keep controlling output via plain
-    strings without needing real token ids."""
+    README "Results"). This stub carries the intended text as the first
+    token_ids entry and unwraps it, so tests keep controlling output via
+    plain strings without needing real token ids."""
 
     def decode(self, token_ids):
         return token_ids[0]
+
+    def convert_tokens_to_ids(self, token_str):
+        assert token_str == "<|im_end|>", token_str
+        return _IM_END_SENTINEL
 
 
 def _mock_common(monkeypatch):
@@ -27,6 +39,18 @@ def _mock_common(monkeypatch):
 def _payload(text: str) -> dict:
     return {
         "token_ids": [text],
+        "setup_ms": 0.1,
+        "prefill_ms": 10.0,
+        "decode_ms": 20.0,
+    }
+
+
+def _payload_ending_in_im_end(text: str) -> dict:
+    """A payload whose last token_ids entry is the turn-end marker, the way
+    a real trtmc response would end one -- text is everything decode()
+    should produce *after* agent.py slices the marker off."""
+    return {
+        "token_ids": [text, _IM_END_SENTINEL],
         "setup_ms": 0.1,
         "prefill_ms": 10.0,
         "decode_ms": 20.0,
@@ -241,6 +265,173 @@ def test_no_example_by_default(monkeypatch):
         {"role": "system", "content": "You are a helpful assistant with access to tools."},
         {"role": "user", "content": "the real task"},
     ]
+
+
+def test_trailing_im_end_marker_is_stripped_from_final_answer(monkeypatch):
+    # trtmc's own (buggy) text field used to implicitly swallow this
+    # template artifact; agent.py now strips it itself by slicing the
+    # matching token id off the *end of token_ids*, before ever calling
+    # decode() -- not by matching a decoded string's suffix, which a
+    # trailing newline/whitespace after the token would silently defeat.
+    _mock_common(monkeypatch)
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: _payload_ending_in_im_end("the final answer"))
+
+    answer, _ = agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="do something", verbose=False,
+    )
+    assert answer == "the final answer"
+
+
+def test_trailing_im_end_marker_does_not_break_tool_call_parsing_or_leak_into_history(monkeypatch):
+    # The marker token is sliced off BEFORE decode(), so a tool call whose
+    # last real token is immediately followed by the turn-end marker must
+    # still decode to well-formed XML and be recognized/executed, and the
+    # assistant turn stored in history must not carry the marker forward
+    # into later prompt renders.
+    _mock_common(monkeypatch)
+    tool_call = '<function name="calculator"><param name="expression">2+2</param></function>'
+    responses = [_payload_ending_in_im_end(tool_call), _payload("done")]
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: responses.pop(0))
+    captured_messages = []
+    monkeypatch.setattr(
+        agent, "render_prompt",
+        lambda tokenizer, messages, tools: captured_messages.append([dict(m) for m in messages]) or "RENDERED_PROMPT",
+    )
+
+    answer, perf = agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="what is 2+2", verbose=False,
+    )
+    assert answer == "done"
+    assert perf.turns == 2
+    second_call_messages = captured_messages[1]
+    assistant_messages = [m for m in second_call_messages if m["role"] == "assistant"]
+    assert len(assistant_messages) == 1
+    assert "<|im_end|>" not in assistant_messages[0]["content"]
+    tool_responses = [
+        m for m in second_call_messages
+        if m["role"] == "user" and "<tool_response>" in m["content"]
+    ]
+    assert any("4" in m["content"] for m in tool_responses)
+
+
+def test_embedded_im_end_text_with_no_trailing_marker_token_is_untouched(monkeypatch):
+    # agent.py never does any string-level matching on "<|im_end|>" -- it
+    # only ever inspects the last *token id*. So literal text that happens
+    # to contain the substring "<|im_end|>" (describing the token itself,
+    # say), with no turn-end marker token actually present, must survive
+    # completely unchanged -- there's nothing here for the token-id check
+    # to even look at.
+    _mock_common(monkeypatch)
+    text = "the token <|im_end|> marks end of turn."
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: _payload(text))
+
+    answer, _ = agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="do something", verbose=False,
+    )
+    assert answer == text
+
+
+def test_perf_total_tokens_reflects_real_token_ids_length_not_turn_count(monkeypatch):
+    # PerfSummary.total_tokens is reported to the user as genuine
+    # engineering signal -- it must come from the actual decoded
+    # len(payload["token_ids"]) each turn, not e.g. a fixed one-per-turn
+    # count or len(raw_output). Padding token_ids with extra entries (the
+    # stub tokenizer only ever reads index 0 to get the intended text)
+    # lets this be checked without a real tokenizer.
+    _mock_common(monkeypatch)
+
+    def _payload_with_token_count(text, n_tokens):
+        return {
+            "token_ids": [text] + [0] * (n_tokens - 1),
+            "setup_ms": 0.0,
+            "prefill_ms": 0.0,
+            "decode_ms": 0.0,
+        }
+
+    responses = [
+        _payload_with_token_count(
+            '<function name="calculator"><param name="expression">1+1</param></function>', 7
+        ),
+        _payload_with_token_count("final answer", 3),
+    ]
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: responses.pop(0))
+
+    _, perf = agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="do something", verbose=False,
+    )
+    assert perf.total_tokens == 10
+
+
+def test_one_shot_example_persists_across_subsequent_turns_alongside_tool_calls(monkeypatch):
+    # ONE_SHOT_EXAMPLE must remain in history for every turn's render, not
+    # just the first prompt -- and a later turn's tool-call round trip must
+    # not duplicate or otherwise mutate it.
+    _mock_common(monkeypatch)
+    responses = [
+        _payload('<function name="calculator"><param name="expression">1+1</param></function>'),
+        _payload("final answer"),
+    ]
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: responses.pop(0))
+    captured_messages = []
+    monkeypatch.setattr(
+        agent, "render_prompt",
+        lambda tokenizer, messages, tools: captured_messages.append([dict(m) for m in messages]) or "RENDERED_PROMPT",
+    )
+
+    agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="the real task", verbose=False, include_example=True,
+    )
+    assert len(captured_messages) == 2
+    example_len = len(agent.ONE_SHOT_EXAMPLE)
+    for messages in captured_messages:
+        assert messages[1 : 1 + example_len] == agent.ONE_SHOT_EXAMPLE
+    second_turn = captured_messages[1]
+    assert second_turn.count(agent.ONE_SHOT_EXAMPLE[0]) == 1
+
+
+def test_trtmc_invocation_failure_returns_a_clear_error_instead_of_crashing(monkeypatch):
+    # run_trtmc failing (subprocess crash, timeout, malformed JSON, or a
+    # payload missing token_ids) is an infrastructure failure, not something
+    # another model turn can reformulate around -- it must come back as a
+    # normal "error: ..." return, not an uncaught exception that takes down
+    # the whole agent process.
+    import subprocess
+
+    _mock_common(monkeypatch)
+
+    def _raise(*a, **k):
+        raise subprocess.CalledProcessError(returncode=1, cmd=["trtmc"])
+
+    monkeypatch.setattr(agent, "run_trtmc", _raise)
+
+    answer, perf = agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="do something", verbose=False,
+    )
+    assert answer.startswith("error: trtmc invocation failed")
+    assert perf.turns == 0
+
+
+def test_payload_missing_token_ids_returns_a_clear_error_instead_of_crashing(monkeypatch):
+    # A malformed/degenerate trtmc response (e.g. an error payload with no
+    # token_ids at all) must not surface as a bare uncaught KeyError.
+    _mock_common(monkeypatch)
+    monkeypatch.setattr(
+        agent, "run_trtmc",
+        lambda *a, **k: {"setup_ms": 0.0, "prefill_ms": 0.0, "decode_ms": 0.0},
+    )
+
+    answer, perf = agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="do something", verbose=False,
+    )
+    assert answer.startswith("error: trtmc invocation failed")
+    assert perf.turns == 0
 
 
 def test_recovers_after_one_error_then_succeeds(monkeypatch):

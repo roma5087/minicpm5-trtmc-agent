@@ -65,12 +65,21 @@ def measure(
         run_once(binary, bundle, runtime_root, prompt, max_new_tokens)
 
     prefill_ms, decode_ms, ms_per_token = [], [], []
-    for _ in range(repeats):
+    for i in range(repeats):
         payload = run_once(binary, bundle, runtime_root, prompt, max_new_tokens)
-        tokens = len(payload.get("token_ids", [])) or 1
-        prefill_ms.append(payload["prefill_ms"])
-        decode_ms.append(payload["decode_ms"])
-        ms_per_token.append(payload["decode_ms"] / tokens)
+        try:
+            tokens = len(payload.get("token_ids", [])) or 1
+            prefill_ms.append(payload["prefill_ms"])
+            decode_ms.append(payload["decode_ms"])
+            ms_per_token.append(payload["decode_ms"] / tokens)
+        except KeyError as error:
+            # A malformed/unexpected trtmc payload mid-run (e.g. an error
+            # response instead of the expected timing fields) should say
+            # which of the `repeats` invocations it was, not surface as a
+            # bare KeyError with no context about which run produced it.
+            raise RuntimeError(
+                f"run {i + 1}/{repeats}: trtmc payload missing {error}: {payload!r}"
+            ) from error
 
     return {
         "prefill_ms_avg": statistics.mean(prefill_ms),

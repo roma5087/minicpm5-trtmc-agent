@@ -42,7 +42,12 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "expression": {
                         "type": "string",
-                        "description": "An expression, e.g. '150 * 3.7' or '4200 <= 5000'.",
+                        "description": (
+                            "An expression, e.g. '150 * 3.7'. A comparison using < or <= "
+                            "must be CDATA-wrapped (e.g. <![CDATA[4200 <= 5000]]>), same as "
+                            "any value containing a literal '<'; >, >=, ==, != need no "
+                            "wrapping."
+                        ),
                     },
                 },
                 "required": ["expression"],
@@ -105,11 +110,22 @@ _ALLOWED_COMPAREOPS = {
 }
 
 
+# Caps the cost of ** before it runs, not after: computing a huge-exponent
+# int (e.g. 99**99999999) is expensive in itself, well before the existing
+# int-to-str guard (see calculator()'s docstring) ever gets a chance to
+# reject the *result* -- this bounds the *operation*, not just its output.
+_MAX_POW_EXPONENT_MAGNITUDE = 10_000
+
+
 def _eval_node(node: ast.AST) -> float | bool:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-        return _ALLOWED_BINOPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > _MAX_POW_EXPONENT_MAGNITUDE:
+            raise ValueError(f"exponent magnitude too large: {right!r}")
+        return _ALLOWED_BINOPS[type(node.op)](left, right)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
         return _ALLOWED_UNARYOPS[type(node.op)](_eval_node(node.operand))
     if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _ALLOWED_COMPAREOPS:
