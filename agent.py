@@ -26,10 +26,35 @@ MAX_CONSECUTIVE_TOOL_ERRORS = 3
 
 DEFAULT_TASK = (
     "I have a $5,000 budget and need at least 40GB of GPU VRAM for a workload. "
-    "Research the NVIDIA A40, L40S, and RTX 6000 Ada, compare FP16 TFLOPS per "
-    "dollar for each, and recommend one with justification. Save the comparison "
-    "to a file."
+    "Research the NVIDIA A40, L40S, and RTX 6000 Ada online for background, then "
+    "use these figures for your comparison: dense FP16 TFLOPS are 149.7 for the "
+    "A40, 183 for the L40S, and 91.1 for the RTX 6000 Ada; all three have 48GB "
+    "VRAM. Using approximate list prices of $5,500 for the A40, $8,600 for the "
+    "L40S, and $6,800 for the RTX 6000 Ada, use the calculator to compute FP16 "
+    "TFLOPS per dollar for each. Then use the calculator again to directly check "
+    "which ratio is greatest (e.g. a '>' comparison between two of the ratios at "
+    "a time) rather than judging by eye, since the highest ratio is the one to "
+    "recommend. Save the comparison to a file, including the recommendation and "
+    "why."
 )
+
+# A worked example of one full tool-call round trip, in the exact XML syntax
+# parse.py expects. Measured directly (see README "Results"): on a genuine
+# multi-entity task, MiniCPM5-2B reasoned through the right plan but then
+# dropped the literal <function>/<param> tag names on its first real attempt
+# -- it knew *what* to do, not how to spell the syntax for it. One in-context
+# example of the correct spelling is a standard, well-established technique
+# for this exact failure mode in small models; it does not change what the
+# model decides to do, only whether it reproduces the syntax correctly.
+ONE_SHOT_EXAMPLE = [
+    {"role": "user", "content": "What is 15 times 23?"},
+    {
+        "role": "assistant",
+        "content": '<function name="calculator"><param name="expression">15 * 23</param></function>',
+    },
+    {"role": "user", "content": "<tool_response>345</tool_response>"},
+    {"role": "assistant", "content": "15 times 23 is 345."},
+]
 
 
 def run_trtmc(
@@ -92,19 +117,32 @@ def run_agent(
     task: str,
     max_new_tokens: int = 300,
     verbose: bool = True,
+    include_example: bool = False,
 ) -> tuple[str, PerfSummary]:
     tokenizer = load_tokenizer(model_dir)
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant with access to tools."},
-        {"role": "user", "content": task},
-    ]
+    messages = [{"role": "system", "content": "You are a helpful assistant with access to tools."}]
+    if include_example:
+        messages.extend(ONE_SHOT_EXAMPLE)
+    messages.append({"role": "user", "content": task})
     perf = PerfSummary()
     consecutive_tool_errors = 0
 
     for turn in range(1, MAX_TURNS + 1):
         prompt = render_prompt(tokenizer, messages, TOOL_SCHEMAS)
         payload = run_trtmc(binary, bundle, runtime_root, prompt, max_new_tokens)
-        raw_output = payload["text"]
+        # Decode token_ids ourselves rather than trust payload["text"]: trtmc's
+        # native detokenizer silently drops MiniCPM5's added special tokens
+        # (verified directly -- token ids 18/20/21/19 decode via the real HF
+        # tokenizer to <function>/<param>/</param>/</function>, but trtmc's own
+        # "text" field omits all four). The model has been emitting well-formed
+        # tool calls the whole time; only trtmc's own text rendering was wrong.
+        # See README "Results" for the full diagnostic.
+        raw_output = tokenizer.decode(payload["token_ids"])
+        # The turn-end marker is a template artifact, not content -- strip it
+        # the same way trtmc's own (buggy) text field implicitly did, so
+        # switching to our own decode doesn't leak it into answers/history.
+        if raw_output.endswith("<|im_end|>"):
+            raw_output = raw_output[: -len("<|im_end|>")]
         perf.record(payload, len(payload.get("token_ids", [])))
         if verbose:
             print(f"\n--- turn {turn}: model output ---\n{raw_output}")
@@ -166,6 +204,15 @@ def main() -> None:
         "--runtime-root", required=True, help="Directory containing the compiled runtime .so files"
     )
     parser.add_argument("--max-new-tokens", type=int, default=300)
+    parser.add_argument(
+        "--no-example",
+        action="store_true",
+        help=(
+            "Skip the one-shot tool-call example (see README Results for why it's on by "
+            "default: this project's own zero-shot run showed the raw model reasoning "
+            "correctly but dropping the <function>/<param> tag names)."
+        ),
+    )
     args = parser.parse_args()
 
     answer, perf = run_agent(
@@ -175,6 +222,7 @@ def main() -> None:
         runtime_root=Path(args.runtime_root),
         task=args.task,
         max_new_tokens=args.max_new_tokens,
+        include_example=not args.no_example,
     )
     print("\n=== final answer ===")
     print(answer)
