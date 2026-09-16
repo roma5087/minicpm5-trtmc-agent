@@ -55,6 +55,40 @@ def test_measure_computes_stdev_only_when_repeats_greater_than_one(monkeypatch):
     assert result["ms_per_token_stdev"] > 0.0
 
 
+def test_measure_does_not_run_an_extra_warmup_invocation_when_repeats_is_one(monkeypatch):
+    # test_measure_skips_warmup_discard_when_repeats_is_one (above) only
+    # checks the resulting averages, and its mock always returns the same
+    # constant payload -- so it can't tell an accidental extra warmup call
+    # apart from none at all. This counts actual invocations of run_once():
+    # an extra "wasted" trtmc subprocess call at repeats=1 would double the
+    # real cost of that measurement in production, invisibly to the
+    # existing test.
+    call_count = {"n": 0}
+
+    def _counting_run_once(*a, **k):
+        call_count["n"] += 1
+        return _payload(decode_ms=42.0)
+
+    monkeypatch.setattr(precision_compare, "run_once", _counting_run_once)
+    precision_compare.measure(Path("trtmc"), Path("b.bundle"), Path("."), "prompt", 64, repeats=1)
+    assert call_count["n"] == 1
+
+
+def test_measure_wraps_malformed_payload_keyerror_with_run_index_context(monkeypatch):
+    # No existing test ever triggers the "except KeyError" wrapper at all --
+    # deleting the whole try/except (letting a bare KeyError propagate) left
+    # the full suite green. This forces a malformed mid-run payload (missing
+    # prefill_ms/decode_ms) and checks it surfaces as the documented
+    # RuntimeError, naming which of the `repeats` invocations it was.
+    responses = [
+        _payload(decode_ms=999.0),  # warmup
+        {"token_ids": [1, 2, 3]},  # malformed: missing prefill_ms/decode_ms
+    ]
+    monkeypatch.setattr(precision_compare, "run_once", lambda *a, **k: responses.pop(0))
+    with pytest.raises(RuntimeError, match=r"run 1/2.*prefill_ms"):
+        precision_compare.measure(Path("trtmc"), Path("b.bundle"), Path("."), "prompt", 64, repeats=2)
+
+
 def test_main_rejects_repeats_below_one(monkeypatch, capsys):
     monkeypatch.setattr(
         "sys.argv",

@@ -110,6 +110,23 @@ def test_well_formed_call_still_parses_after_a_malformed_one():
     assert any(c["name"] == "ok" and c["arguments"] == {"y": "1"} for c in calls)
 
 
+def test_cdata_value_with_leading_and_trailing_whitespace_preserved_verbatim():
+    # Unlike a non-CDATA value (which IS .strip()-ed, tested above), a
+    # CDATA-wrapped value is supposed to be preserved byte-for-byte,
+    # including leading/trailing whitespace -- but the existing "preserved
+    # verbatim" test's content has no surrounding whitespace, so it can't
+    # tell "verbatim" apart from "verbatim except .strip()-ed". Adding a
+    # .strip() to the CDATA branch left the full suite green.
+    text = (
+        '<function name="write_file">'
+        '<param name="filename">report.txt</param>'
+        '<param name="content"><![CDATA[  padded content  ]]></param>'
+        "</function>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls[0]["arguments"]["content"] == "  padded content  "
+
+
 def test_unwrapped_comparison_value_containing_a_bare_lt_is_dropped_not_parsed():
     # A value containing a literal "<" (e.g. a "<=" comparison, which
     # tools.py's calculator schema supports) is NOT safe to leave unwrapped
