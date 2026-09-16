@@ -8,10 +8,17 @@ is the reasoning core, compiled and served through NVIDIA's
 ## Why this exists
 
 Grew out of investigating and fixing a real `families/llama` bug in
-TensorRT-Model-Connect ([PR #1269](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1269))
-that surfaced while validating MiniCPM5-2B against that framework. This
-project puts the fixed build path to actual use, and measures what it
-actually costs and delivers rather than just claiming it works.
+TensorRT-Model-Connect that surfaced while validating MiniCPM5-2B against
+that framework: HF configs may declare `eos_token_id` as a list of stop
+tokens (Llama 3.1+, MiniCPM5-2B), and the generic Llama family kept only one.
+Opened as [PR #1269](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1269);
+closed in favor of [PR #1288](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1288),
+which landed the same fix independently with a better approach (additive --
+only writes the multi-id field when there's more than one, so single-EOS
+bundles are untouched -- plus vocab-bounds validation this PR didn't have)
+and merged into `upstream/main`. This project builds against that merged fix
+and puts it to actual use, measuring what it actually costs and delivers
+rather than just claiming it works.
 
 ## Task
 
@@ -80,24 +87,101 @@ calling is implemented entirely in Python, not inside `trtmc` itself:
 
 ## Results
 
-`trtmc`'s own JSON output already reports `setup_ms`/`prefill_ms`/`decode_ms`
-per invocation. `agent.py` accumulates these across the run instead of
-discarding them and prints a summary alongside the final answer.
+Measured on a rented A100-SXM4-40GB (driver 570.148.08, running the CUDA
+13.3 NGC image via CUDA Forward Compatibility), building `families/llama`
+from `upstream/main` at the commit that merged
+[PR #1288](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1288)
+(the multi-EOS fix; supersedes this project's own [PR #1269](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1269),
+closed in favor of #1288's additive, better-validated approach -- see "Why
+this exists" above). Both bundles built with `max_sequence_length=4096`,
+`tensor_parallel_size=1`, no quantization.
 
-*Pending a live GPU session -- this section will be replaced with the actual
-measured numbers from a real run (engine invocation count, cumulative
-prefill/decode time, ms/token, and the bf16-vs-fp16 comparison table) once
-captured. No fabricated numbers belong here in the meantime.*
+**Precision comparison** (`precision_compare.py`, prompt "Explain what a KV
+cache does in one paragraph.", `max_new_tokens=64`, `repeats=5`, first
+invocation per precision discarded as warmup):
+
+| precision | prefill_ms | decode_ms | ms/token | stdev |
+|---|---|---|---|---|
+| bf16 | 90.24 | 920.35 | 14.380 | 0.032 |
+| fp16 | 159.06 | 883.85 | 13.810 | 0.004 |
+
+fp16 was ~1.04x faster per token in this run -- a small, real difference,
+not the large gap sometimes assumed between the two. fp16 also had lower
+run-to-run variance (stdev 0.004 vs 0.032 ms/token). Notably, fp16's
+*prefill* was slower than bf16's (159ms vs 90ms) despite its faster decode --
+a genuine, slightly counterintuitive result, reported as measured rather
+than smoothed over.
+
+**Agent run** (`agent.py`, the GPU-budget-comparison task above,
+`--max-new-tokens 1024`, bf16 bundle):
+
+```
+engine invocations : 1 (one per turn -- trtmc has no server mode)
+total prefill time  : 145.72 ms
+total decode time   : 6462.91 ms across 451 tokens
+avg decode/token    : 14.330 ms
+```
+
+The single-invocation `avg decode/token` (14.330 ms) lines up closely with
+`precision_compare.py`'s independently-measured bf16 figure (14.380
+ms/token) -- two different code paths measuring the same underlying engine
+land within 0.4% of each other, which is a reasonable cross-check that both
+measurements are real.
+
+**What actually happened in that run, reported honestly:** MiniCPM5-2B's
+`<think>` reasoning correctly worked out the right multi-step plan (search
+each GPU's specs, compute FP16 TFLOPS/$ for each, compare, save to a file).
+But its first action attempt was a **malformed tool call**: it dropped the
+literal `<function`/`<param` tag names and emitted only the attribute
+fragments -- `name="web_search"> name="query">NVIDIA A40 GPU specs FP16
+TFLOPS price` instead of `<function name="web_search"><param
+name="query">...`. `parse.py`'s scanner correctly found no well-formed
+`<function` tag and returned zero calls rather than guessing at one, so the
+agent safely treated the malformed fragment as a plain final answer instead
+of executing a corrupted action or crashing. This is deterministic, not a
+one-off: a shorter run capped at `--max-new-tokens 300` produced a `<think>`
+block that is an exact prefix of this run's, confirming `trtmc` decodes
+greedily here and this is reproducible behavior for this prompt, not
+sampling noise.
+
+This is reported as the real result rather than re-rolled or prompt-tuned
+away, because a small (2.5B parameter) model's raw tool-call reliability on
+a genuinely multi-entity task is itself the useful finding: the parser's
+job is to fail safe when that happens, and it did.
 
 ## Setup
 
 Requires a machine with TensorRT-Model-Connect already built (the `trtmc`
 CLI binary + compiled `families/llama` runtime `.so`s) and the MiniCPM5-2B
-bundle already built through it -- see the parent repo's own build docs.
+bundle already built through it -- build against `upstream/main` (the
+`eos_token_id` fix landed there via #1288; no fork branch needed anymore).
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Two non-obvious GPU-setup gotchas hit while validating this on rented
+hardware, worth knowing before debugging them from scratch again:
+
+- **`CMAKE_CUDA_ARCHITECTURES` defaults to 89 (Ada Lovelace) in TRT-MC's own
+  GPU dev Dockerfile and CI**, matching the community CI's L4/L40/L40S
+  fleet. On any other architecture (this project validated on an A100,
+  compute capability 8.0), override it explicitly when building
+  (`-e CMAKE_CUDA_ARCHITECTURES=80` for the `tools.community_gpu_ci` build
+  path). In practice this only matters for families with actual `.cu`
+  kernel sources -- `families/llama` has none (pure C++ against TensorRT's
+  runtime API), so its build is unaffected either way, but other families
+  are not.
+- **NGC images' CUDA Forward Compatibility setup does not survive `docker
+  exec` into an already-running container.** The entrypoint script
+  (`nvidia_entrypoint.sh`) sets up the compat `LD_LIBRARY_PATH` only for the
+  process it directly launches (e.g. `sleep infinity` for a long-lived dev
+  container); a later `docker exec` into that same container starts a fresh
+  environment that doesn't inherit it, so `torch.cuda.is_available()`
+  silently returns `False` with a "driver too old" warning even though the
+  same command works fine via `docker run --rm`. Fix: pass
+  `-e LD_LIBRARY_PATH=/usr/local/cuda/compat/lib` explicitly on every
+  `docker exec` that needs GPU access into such a container.
 
 ## Run
 
@@ -123,11 +207,19 @@ python precision_compare.py \
 
 - No persistent server: every agent turn pays full engine-load time. Fine
   for a demo; a real deployment needs a long-running server instead.
-- Tool-call parsing is XML-regex-based, matched to MiniCPM5's specific
+- Tool-call parsing is a hand-written scanner matched to MiniCPM5's specific
   template convention -- not a general-purpose tool-call parser.
 - Single GPU, single request at a time. No batching, no concurrency.
 - `web_search` depends on a third-party search library (`ddgs`); result
   quality/availability isn't controlled by this project.
+- **MiniCPM5-2B does not reliably reproduce its own template's `<function>`
+  tag syntax on multi-entity tasks.** Measured directly (see Results): on
+  this project's own demo task, the model correctly reasoned through the
+  right multi-step plan but then dropped the literal tag names from its
+  first tool-call attempt. This is a real characteristic of a 2.5B-parameter
+  model's tool-calling reliability, not a bug in this project's prompt
+  rendering or parsing -- the parser's role is to fail safe when it happens
+  (drop the malformed call rather than guess), which it does.
 
 ## Status
 
@@ -142,5 +234,7 @@ malformed output, and unstripped `<think>` blocks compounding across turns --
 all fixed and covered by regression tests. Non-GPU-dependent parts
 (`parse.py`, `tools.py`, `agent.py`'s orchestration logic, `render.py`,
 `precision_compare.py`'s own arithmetic) are covered by 39 tests, all passing
-locally. Full agent-loop and `precision_compare.py` runs against a real
-compiled bundle are pending a GPU session.
+locally. `agent.py` and `precision_compare.py` have both been run end-to-end
+against real compiled bundles on an A100-SXM4-40GB, building `families/llama`
+from `upstream/main`; see Results above for the actual measured numbers and
+observed model behavior.
