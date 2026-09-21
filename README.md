@@ -1,247 +1,193 @@
-# MiniCPM5-2B Tool-Calling Agent, served via TensorRT-Model-Connect
+# MiniCPM5-2B tool-calling agent on TensorRT-Model-Connect
 
-A tool-calling agent where [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B)
-is the reasoning core, compiled and served through NVIDIA's
+A tool-calling agent whose reasoning core is
+[MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B), compiled and served
+through NVIDIA's
 [TensorRT-Model-Connect](https://github.com/NVIDIA/TensorRT-Model-Connect)
-(`trtmc`) native runtime — not vLLM/SGLang's built-in tool-call support.
+(`trtmc`) native runtime. Tool calling is implemented in Python around the
+runtime, not with an inference server's built-in tool-call support.
 
-## Why this exists
+It started as a way to exercise the multi-EOS fix in `families/llama` (HF
+configs may declare `eos_token_id` as a list; MiniCPM5-2B does). That fix
+landed upstream as
+[#1288](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1288), which
+superseded an earlier PR of mine
+([#1269](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1269), closed).
 
-Grew out of investigating and fixing a real `families/llama` bug in
-TensorRT-Model-Connect that surfaced while validating MiniCPM5-2B against
-that framework: HF configs may declare `eos_token_id` as a list of stop
-tokens (Llama 3.1+, MiniCPM5-2B), and the generic Llama family kept only one.
-Opened as [PR #1269](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1269);
-closed in favor of [PR #1288](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1288),
-which landed the same fix independently with a better approach (additive --
-only writes the multi-id field when there's more than one, so single-EOS
-bundles are untouched -- plus vocab-bounds validation this PR didn't have)
-and merged into `upstream/main`. This project builds against that merged fix
-and puts it to actual use, measuring what it actually costs and delivers
-rather than just claiming it works.
+## How it works
 
-## Task
+`trtmc` has no server mode: every turn is a fresh `trtmc run` subprocess that
+reloads the engine from disk.
 
-> "I have a $5,000 budget and need at least 40GB of GPU VRAM for a workload.
-> Research the NVIDIA A40, L40S, and RTX 6000 Ada online for background, then
-> use these figures for your comparison: dense FP16 TFLOPS are 149.7 for the
-> A40, 183 for the L40S, and 91.1 for the RTX 6000 Ada; all three have 48GB
-> VRAM. Using approximate list prices of $5,500 for the A40, $8,600 for the
-> L40S, and $6,800 for the RTX 6000 Ada, use the calculator to compute FP16
-> TFLOPS per dollar for each. Then use the calculator again to directly check
-> which ratio is greatest (e.g. a '>' comparison between two of the ratios at
-> a time) rather than judging by eye, since the highest ratio is the one to
-> recommend. Save the comparison to a file, including the recommendation and
-> why."
+| file | role |
+|---|---|
+| `render.py` | Renders the whole conversation plus tool schemas with the checkpoint's own Jinja chat template (via `transformers`) and passes the finished text to `trtmc run --use-chat-template false`, instead of relying on the runtime's template detection. |
+| `parse.py` | Position-based scanner for MiniCPM5's `<function name=…><param name=…>…</param></function>` calls. A block that is malformed part-way is dropped, never guessed at; a whole-string regex would silently truncate a CDATA value containing `</param>` or merge two overlapping calls. |
+| `tools.py` | `web_search` (ddgs), `calculator`, `write_file`, `read_file`. The calculator is an AST-restricted evaluator (never `eval`) supporting arithmetic and single comparisons, with every integer intermediate capped at 4,096 bits. File tools are confined to `workspace/`. |
+| `engine.py` | One `trtmc run` call: argv, timeout, JSON parsing. Failures raise `EngineError` carrying the exit status and stderr tail, not the command line (which embeds the whole prompt). |
+| `agent.py` | The loop: render, run, parse, execute tools, append `<tool_response>` turns, repeat. |
+| `precision_compare.py` | Runs one prompt through two prebuilt bundles (bf16, fp16) of the same checkpoint and reports `prefill_ms`, `decode_ms` and ms/token. |
 
-(Verbatim `DEFAULT_TASK` in `agent.py` -- not paraphrased.)
+Behaviours of the loop worth knowing:
 
-Deliberately not a single linear tool chain: it requires researching three
-separate entities, running a calculation per entity, comparing the results,
-and synthesizing a recommendation -- exercising multi-step reasoning and
-repeated tool use, not one search → one calc → done. The reference TFLOPS,
-VRAM, and price figures are supplied directly rather than left for the agent
-to search for -- see Results below for why: earlier runs showed a small
-model can spiral indefinitely when the only path to an answer is resolving
-ambiguous/conflicting numbers pulled from noisy search snippets. Live search
-is still exercised (for background context on each card), just not as the
-sole source of the numbers the recommendation depends on.
+- **Output is decoded from `token_ids` with the real HF tokenizer**, not from
+  `trtmc`'s `text` field (see the finding below).
+- **Only text outside `<think>…</think>` counts.** Tool calls inside reasoning
+  are not executed, and reasoning is not stored in history (the template
+  re-renders history every turn). An unclosed `<think>` is discarded.
+- **Truncation is an error.** Output that reaches `--max-new-tokens` without an
+  end marker returns an error instead of being treated as an answer.
+- **A call the parser rejects is reported back to the model**, not returned as
+  the final answer.
+- **Tool arguments are checked against the tool's schema** before the call.
+- **Every tool result is sanitized where it enters the prompt.** `trtmc`'s
+  encoder matches every added token as a substring anywhere in the prompt, so
+  the token list is read from the tokenizer and each match is broken with a
+  zero-width space; NUL bytes and lone surrogates are removed.
+- **The prompt is length-checked** against `--max-sequence-length` (default
+  4096, must equal the bundle's build setting) before `trtmc` is invoked.
+- Tool errors are fed back so the model can retry; three consecutive error
+  turns stop the run.
+- An optional one-shot example of a full tool-call round trip is on by default
+  (`--no-example` to disable).
 
-## Method
+## The trtmc finding
 
-`trtmc` has no persistent/server mode -- every turn is a fresh `trtmc run`
-subprocess invocation that reloads the compiled engine from disk. Tool
-calling is implemented entirely in Python, not inside `trtmc` itself:
+Early runs produced malformed tool calls: the literal `<function` / `<param`
+tags were missing from the text, leaving only `name="…"` fragments. Comparing
+`trtmc`'s `text` field with `tokenizer.decode()` of the same `token_ids` showed
+the model had emitted the tag tokens all along; they were absent from `text`.
 
-- **`render.py`** -- renders the full multi-turn conversation + tool schemas
-  into one prompt string using the checkpoint's *own* Jinja chat template
-  (via `transformers.AutoTokenizer.apply_chat_template`), rather than
-  `trtmc run --use-chat-template true`'s C++ template-detection heuristic.
-  That heuristic substring-sniffs the template to classify it into one of a
-  few known formats and was found to misclassify at least one other model's
-  template during this investigation -- tool-calling depends on exact
-  template fidelity (the `<tools>` block, `<tool_response>` wrapping, etc.),
-  so this sidesteps that path entirely.
-- **`parse.py`** -- extracts MiniCPM5's `<function name="..."><param
-  name="...">value</param></function>` tool-call XML from the model's raw
-  output text. A position-based scanner, not a single whole-string regex --
-  a greedy/non-greedy regex would either silently truncate a CDATA-wrapped
-  value containing a literal `</param>`, or silently *merge* two overlapping
-  hallucinated `<function>` blocks into one call with foreign arguments. Both
-  failure modes are worse than raising, since the caller would then execute a
-  corrupted action with no signal anything went wrong. This scanner instead
-  parses each call strictly outward from its own opening tag and drops (never
-  guesses at) a block that turns out malformed partway through.
-- **`tools.py`** -- the actual tool implementations (`web_search`,
-  `calculator`, `write_file`, `read_file`) and their JSON-schema definitions.
-  `calculator` supports arithmetic and comparisons (`<`, `<=`, `==`, ...) via
-  an AST-restricted evaluator -- never `eval()` -- so the agent can check a
-  budget constraint explicitly instead of eyeballing it. File tools are
-  sandboxed to `workspace/` with path-escape rejected.
-- **`agent.py`** -- the loop: render → run `trtmc` → parse for tool calls →
-  execute them → append results as `<tool_response>`-wrapped turns → repeat
-  until the model returns a plain answer, capped at `MAX_TURNS`. A tool
-  error is fed back to the model as a normal turn (so it can retry/reformulate
-  on its own), with a `MAX_CONSECUTIVE_TOOL_ERRORS` cap so a genuinely stuck
-  tool can't silently burn every remaining turn (any tool call failing within
-  a turn counts that whole turn as an error turn; a turn where every call
-  succeeds resets the counter). Each turn's assistant output is stripped of
-  its `<think>...</think>` block before being stored in history -- MiniCPM5's
-  own template re-renders the full history back into the next prompt, so an
-  unstripped `<think>` block would compound turn over turn. Every turn's raw
-  output is decoded from `trtmc`'s own `token_ids` via the real HF tokenizer,
-  **not** `trtmc`'s own `text` field -- see Results below for the bug this
-  works around. An optional one-shot example (`ONE_SHOT_EXAMPLE`, on by
-  default; `--no-example` to disable) shows one full tool-call round trip in
-  the exact expected syntax, a standard technique for small-model tool-call
-  reliability.
-- **`precision_compare.py`** -- a standalone script that runs the identical
-  prompt through two pre-built bundles of the same checkpoint (one bf16, one
-  fp16) and reports measured `prefill_ms`/`decode_ms`/ms-per-token for each --
-  a real comparison, not a claim. Renders the prompt via `render.py`'s own
-  chat-template path (the same one `agent.py` uses), not `trtmc run
-  --use-chat-template true`, for the same template-fidelity reason as above --
-  a precision comparison built on the distrusted path could end up measuring
-  a different prompt structure per precision, silently confounding the
-  comparison. Discards the first invocation per precision as a warmup run
-  (unless `--repeats 1`) and reports a standard deviation across the rest.
+The cause is in `families/llama/runtime/bpe_tokenizer.cpp`: decode skips every
+id whose `tokenizer.json` entry has `"special": true`, and that flag is
+described in the source as controlling "decode filtering". MiniCPM5 flags
+`<function`, `</function>`, `<param`, `</param>` (ids 18–21) and `<|im_end|>`
+(130073) as special; `<think>` and `</think>` (8, 9) are not flagged, which is
+why reasoning survives in `text` and tool calls do not. Encode, by contrast,
+matches all added tokens, special or not, as substrings.
+
+So this is a design default with no opt-out (the equivalent of
+`skip_special_tokens=True`), not corruption. For a model whose tool-call tags
+are special tokens, `token_ids` is the interface to use. `agent.py` does that
+and needs no change to TensorRT-Model-Connect. It is not filed upstream.
 
 ## Results
 
-Measured on a rented A100-SXM4-40GB (driver 570.148.08, running the CUDA
-13.3 NGC image via CUDA Forward Compatibility), building `families/llama`
-from `upstream/main` at the commit that merged
-[PR #1288](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1288)
-(the multi-EOS fix; supersedes this project's own [PR #1269](https://github.com/NVIDIA/TensorRT-Model-Connect/pull/1269),
-closed in favor of #1288's additive, better-validated approach -- see "Why
-this exists" above). Both bundles built with `max_sequence_length=4096`,
-`tensor_parallel_size=1`, no quantization.
+One run each, on a rented A100-SXM4-40GB (driver 570.148.08, CUDA 13.3 NGC
+image via forward compatibility), `families/llama` built from `upstream/main`
+at the commit that merged #1288, both bundles `max_sequence_length=4096`,
+`tensor_parallel_size=1`, no quantization. **These were recorded before the
+loop changes described above and have not been re-run.**
 
-**Precision comparison** (`precision_compare.py`, prompt "Explain what a KV
-cache does in one paragraph.", `max_new_tokens=64`, `repeats=5`, first
-invocation per precision discarded as warmup):
+**bf16 vs fp16** (`precision_compare.py`, "Explain what a KV cache does in one
+paragraph.", `max_new_tokens=64`, 5 runs after one discarded warmup):
 
 | precision | prefill_ms | decode_ms | ms/token | stdev |
 |---|---|---|---|---|
 | bf16 | 90.24 | 920.35 | 14.380 | 0.032 |
 | fp16 | 159.06 | 883.85 | 13.810 | 0.004 |
 
-fp16 was ~1.04x faster per token in this run -- a small, real difference,
-not the large gap sometimes assumed between the two. fp16 also had lower
-run-to-run variance (stdev 0.004 vs 0.032 ms/token). Notably, fp16's
-*prefill* was slower than bf16's (159ms vs 90ms) despite its faster decode --
-a genuine, slightly counterintuitive result, reported as measured rather
-than smoothed over.
+How much weight to put on this: not much.
 
-**Agent run, final working state** (`agent.py`, the task above,
-`--max-new-tokens 1024`, bf16 bundle):
+- The two bundles are separate engine builds, run one precision after the
+  other. The 4% ms/token gap is far outside run-to-run noise but is not shown
+  to be a precision effect; build-to-build variance was not measured (build
+  each precision twice and compare).
+- Each invocation is a fresh process, so `prefill_ms` on a ~40-token prompt is
+  mostly per-process start-up cost, not prefill compute. The bf16/fp16 prefill
+  difference should not be read as a property of either precision.
+- bf16 and fp16 are both 2 bytes wide, so a small decode difference is what
+  one would expect if decode is dominated by streaming weights.
 
-```
-engine invocations : 4 (one per turn -- trtmc has no server mode)
-total prefill time  : 616.96 ms
-total decode time   : 15860.76 ms across 1108 tokens
-avg decode/token    : 14.315 ms
-```
-
-`avg decode/token` (14.315 ms) again lines up with `precision_compare.py`'s
-independently-measured bf16 figure (14.380 ms/token, ~0.5% apart) -- a
-repeated cross-check that the accounting is real. The agent completed all
-four turns for real: three parallel `calculator` calls to compute FP16
-TFLOPS/$ for each GPU, two explicit `>` comparisons to determine the
-highest ratio, a `write_file` call, and a final answer -- correctly
-recommending the NVIDIA A40 (0.0272 TFLOPS/$, the true highest of the
-three) with correct justification, verified against the real file it wrote:
+**Agent run** (task below, `--max-new-tokens 1024`, bf16), excerpt:
 
 ```
-FP16 TFLOPS per Dollar Comparison:
-- NVIDIA A40: 0.0272 TFLOPS/$
-- NVIDIA L40S: 0.0201 TFLOPS/$
-- RTX 6K Ada: 0.0134 TFLOPS/$
-
-Recommendation: NVIDIA A40
-Reason: The A40 has the highest FP16 TFLOPS per dollar ratio (0.0272),
-making it the most efficient choice for workloads prioritizing GPU
-performance per unit cost.
+engine invocations : 4
+total prefill time : 616.96 ms
+total decode time  : 15860.76 ms across 1108 tokens
+avg decode/token   : 14.315 ms
 ```
 
-(One residual, minor, and honestly-reported imperfection: it transcribed
-the L40S ratio into that file as 0.0201 rather than its own correctly
-calculated 0.0213 -- a cosmetic slip on a non-winning number that doesn't
-affect the recommendation, which is backed by the actual `>` comparison
-tool calls, not eyeballed.)
+Four turns: three parallel `calculator` calls, two `>` comparisons, a
+`write_file`, then a final answer recommending the A40 (0.0272 TFLOPS/$, the
+highest of the three). The saved file transcribed the L40S ratio as 0.0201
+instead of the 0.0213 it had computed; the recommendation did not depend on it.
 
-**Getting here took two real, diagnosed fixes, not prompt-tuning a lucky
-roll -- both are the actual engineering content of this project:**
+Caveats on this run:
 
-1. **A genuine bug in `trtmc`'s native detokenizer, not a MiniCPM5-2B
-   reliability problem.** Earlier runs showed the model reliably producing
-   *malformed* tool calls -- dropping the literal `<function`/`<param` tag
-   names, keeping only `name="..."` attribute fragments (e.g.
-   `name="web_search"> name="query">...`). This looked like a small-model
-   tool-calling limitation. It wasn't: comparing `trtmc`'s own `"text"`
-   field against `tokenizer.decode()` of the exact same `token_ids` proved
-   the model was correctly generating the special tokens for
-   `<function`/`<param`/`</param>`/`</function>` the whole time --
-   `trtmc`'s own text-rendering path was silently dropping them. Confirmed
-   with both bf16 and fp16 bundles (identical failure, ruling out a
-   precision/quantization cause) and with a trivial single-tool prompt
-   (ruling out "long reasoning corrupts the format"). The fix required no
-   changes to TensorRT-Model-Connect itself: `agent.py` now decodes
-   `token_ids` directly via the real HF tokenizer instead of trusting
-   `trtmc`'s `text` field, which immediately unblocked well-formed tool
-   calls.
-2. **A real synthesis-reliability gap once tool calls were unblocked.**
-   With correct tool-call syntax, the agent reliably executed real
-   `web_search`/`calculator` calls and got correct individual numbers -- but
-   the model twice failed to correctly identify the *largest* of three
-   computed ratios by eye (once concluding a demonstrably smaller number was
-   "highest"). The fix: the task instructs the model to also use the
-   `calculator` tool's comparison support (`>`) to check pairwise which
-   ratio is greatest, rather than trust its own mental comparison of three
-   numbers -- offloading the specific step it was getting wrong to the same
-   AST-restricted tool already used for arithmetic. This produced the
-   correct recommendation, backed by verified tool calls rather than
-   coincidence.
+- **The task it ran had an unsatisfiable budget.** It said $5,000, but the
+  three cards are priced at $5,500 / $8,600 / $6,800. The agent recommended the
+  A40 without flagging that it exceeds the budget. The task now says $10,000.
+- **The throughput figures were supplied, not sourced, and were not checked
+  against datasheets.** The task called them "dense FP16 TFLOPS"; they may not
+  be the same precision or execution path across the three cards. The
+  recommendation is only as good as those inputs, so it says nothing about
+  which card is faster.
+- **It made no `web_search` calls**, so `web_search` and the result
+  sanitization have not been exercised on a GPU.
+- It is a single run. Nothing here measures how reliably the model does this.
 
-Both issues were real, reproduced, and fixed with real GPU runs at each
-step -- not asserted or smoothed over. The failed runs are preserved above
-in spirit (see git history) rather than deleted, because a diagnosed and
-fixed bug is a stronger result than a demo that happened to work on the
-first try.
+## Task
+
+`DEFAULT_TASK` in `agent.py` asks for a three-GPU comparison under a budget:
+compute FP16 TFLOPS per dollar with the calculator, check which ratio is
+greatest with explicit `>` comparisons (a small model misjudged the largest of
+three numbers by eye in earlier runs), and save the recommendation to a file.
+Figures and prices are supplied so the outcome does not hinge on noisy search
+snippets.
+
+## Limitations and open questions
+
+- **No baseline.** Nothing here compares against HF `generate`, vLLM or SGLang
+  on the same GPU, so the numbers say nothing about how the runtime compares.
+- **14.3 ms/token has not been explained.** It has not been compared with the
+  memory-bandwidth floor for this model's weights on this GPU, and nothing has
+  been profiled, so it is unknown whether the time is in the engine or in
+  `trtmc`'s decode loop. `decode_ms / len(token_ids)` may also be off by one if
+  the first token comes from the prefill pass.
+- **Per-turn reload cost** is now measured (wall time is reported next to
+  prefill and decode) but has no recorded run yet.
+- **Encode-side parity is unchecked.** The prompt is rendered by HF but
+  tokenized by `trtmc`'s C++ BPE. Whether both produce identical ids (a
+  double BOS, special-token matching, pre-tokenizer differences) has not been
+  verified; the fix for decode says nothing about encode.
+- **Tool results are formatted as one `user` turn per call**
+  (`<tool_response>…</tool_response>`), which differs from the template's own
+  `tool` role (newlines around the content, consecutive results grouped in one
+  turn). The model may have been trained on the latter; the effect is
+  unmeasured.
+- Sampling parameters are not passed to `trtmc`; whether it decodes greedily
+  by default is not documented here.
+- Tool-call parsing is matched to MiniCPM5's template, not general.
+- One GPU, one request at a time, no batching.
+- `web_search` depends on `ddgs`; result quality is outside this project.
+- Sanitization is pattern-based and validated only against HF's tokenizer
+  behaviour and `trtmc`'s source, not end to end on a GPU.
+- `precision_compare.py` runs all bf16 invocations before all fp16 ones rather
+  than interleaving them.
 
 ## Setup
 
-Requires a machine with TensorRT-Model-Connect already built (the `trtmc`
-CLI binary + compiled `families/llama` runtime `.so`s) and the MiniCPM5-2B
-bundle already built through it -- build against `upstream/main` (the
-`eos_token_id` fix landed there via #1288; no fork branch needed anymore).
+Requires a machine with TensorRT-Model-Connect built (the `trtmc` binary and
+the `families/llama` runtime `.so`s) and a MiniCPM5-2B bundle built through it,
+against `upstream/main` (which contains #1288).
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt        # runtime
+pip install -r requirements-dev.txt    # plus pytest
 ```
 
-Two non-obvious GPU-setup gotchas hit while validating this on rented
-hardware, worth knowing before debugging them from scratch again:
+Two GPU-setup gotchas hit on rented hardware:
 
-- **`CMAKE_CUDA_ARCHITECTURES` defaults to 89 (Ada Lovelace) in TRT-MC's own
-  GPU dev Dockerfile and CI**, matching the community CI's L4/L40/L40S
-  fleet. On any other architecture (this project validated on an A100,
-  compute capability 8.0), override it explicitly when building
-  (`-e CMAKE_CUDA_ARCHITECTURES=80` for the `tools.community_gpu_ci` build
-  path). In practice this only matters for families with actual `.cu`
-  kernel sources -- `families/llama` has none (pure C++ against TensorRT's
-  runtime API), so its build is unaffected either way, but other families
-  are not.
-- **NGC images' CUDA Forward Compatibility setup does not survive `docker
-  exec` into an already-running container.** The entrypoint script
-  (`nvidia_entrypoint.sh`) sets up the compat `LD_LIBRARY_PATH` only for the
-  process it directly launches (e.g. `sleep infinity` for a long-lived dev
-  container); a later `docker exec` into that same container starts a fresh
-  environment that doesn't inherit it, so `torch.cuda.is_available()`
-  silently returns `False` with a "driver too old" warning even though the
-  same command works fine via `docker run --rm`. Fix: pass
-  `-e LD_LIBRARY_PATH=/usr/local/cuda/compat/lib` explicitly on every
-  `docker exec` that needs GPU access into such a container.
+- `CMAKE_CUDA_ARCHITECTURES` defaults to 89 (Ada) in TRT-MC's GPU dev
+  Dockerfile and CI. On other architectures (this was validated on an A100,
+  compute capability 8.0) override it when building, e.g.
+  `-e CMAKE_CUDA_ARCHITECTURES=80` for the `tools.community_gpu_ci` path. It
+  only matters for families with `.cu` sources; `families/llama` has none.
+- NGC images set up CUDA Forward Compatibility only for the entrypoint's own
+  process, so a later `docker exec` sees `torch.cuda.is_available() == False`.
+  Pass `-e LD_LIBRARY_PATH=/usr/local/cuda/compat/lib` on each `docker exec`
+  that needs the GPU.
 
 ## Run
 
@@ -251,8 +197,8 @@ python agent.py \
   --binary /path/to/trtmc \
   --bundle /path/to/minicpm5-2b.bundle \
   --runtime-root /path/to/build-output-dir
-# task defaults to the GPU-comparison scenario above; pass a positional
-# argument to override it with a different task
+# a positional argument overrides the default task;
+# --max-sequence-length must match the bundle's build setting (default 4096)
 ```
 
 ```bash
@@ -264,104 +210,13 @@ python precision_compare.py \
   --fp16-bundle /path/to/minicpm5-2b-fp16.bundle
 ```
 
-## Limitations
+## Tests
 
-- No persistent server: every agent turn pays full engine-load time. Fine
-  for a demo; a real deployment needs a long-running server instead.
-- Tool-call parsing is a hand-written scanner matched to MiniCPM5's specific
-  template convention -- not a general-purpose tool-call parser.
-- Single GPU, single request at a time. No batching, no concurrency.
-- `web_search` depends on a third-party search library (`ddgs`); result
-  quality/availability isn't controlled by this project.
-- **`trtmc`'s native runtime silently drops certain special tokens
-  (`<function`, `<param`, `</param>`, `</function>`, `<|im_end|>`) when
-  detokenizing.** Diagnosed and worked around at the `agent.py` level (see
-  Results) by decoding `token_ids` via the real HF tokenizer instead of
-  trusting `trtmc`'s own `text` field. Not fixed inside TensorRT-Model-Connect
-  itself -- that would need a patch to `families/llama/runtime/bpe_tokenizer.cpp`
-  and is out of this project's scope, though it's a well-diagnosed, reproducible
-  finding (token-id-level proof included) that could become one.
-- **Reference numbers (TFLOPS, VRAM, prices) are supplied in the task rather
-  than sourced entirely by the agent's own web searches.** Earlier runs
-  showed a small model can spiral indefinitely trying to resolve ambiguous
-  or conflicting numbers pulled from noisy search snippets (e.g. a
-  datasheet listing two different TFLOPS figures side by side without
-  labeling which is which). Live search is still used for background
-  context; the numbers the final recommendation depends on are given
-  directly to keep the demo's success bounded by the model's tool-use and
-  synthesis reliability, not by search-result quality.
-- **The model cannot reliably compare multiple computed numbers by
-  eye.** Measured directly: given three independently-correct calculator
-  results, it twice concluded a non-maximal one was the largest. Worked
-  around by instructing it to use the calculator's own comparison support
-  (`>`) to check pairwise rather than judge visually -- a real, reproducible
-  small-model limitation in numeric synthesis, not in tool execution.
-- **`web_search` results are neutralized against known marker substrings
-  (`<|im_end|>`, `<function`, CDATA delimiters, etc.) before being stored
-  in conversation history, but this is pattern-based, not a formal
-  guarantee.** A security review confirmed the underlying mechanism a
-  poisoned search result could exploit -- HF fast tokenizers match
-  registered special tokens as substrings anywhere in text, not just where
-  a template placed them -- but did not have GPU access to validate whether
-  MiniCPM5-2B itself is actually steerable this way end-to-end. Treat the
-  current mitigation as a real fix for the mechanism, not a proven bound on
-  what a sufficiently adversarial search result could still attempt.
+```bash
+python -m pytest -q
+```
 
-## Status
-
-**The agent completes its full task end-to-end on real GPU hardware and
-gives a correct, verified recommendation** -- see Results above for the full
-run and the two real bugs (one in `trtmc`, one in the model's numeric
-synthesis) that had to be found and fixed to get there. Code has been
-through two independent multi-reviewer rounds (three fresh-context passes
-each). Round one (correctness, test
-coverage, documentation accuracy) reproduced concrete bugs -- an uncaught
-crash in the calculator on results too large to `str()`, file-tool I/O calls
-that ran outside their own try/except, a tool-call parser that could
-silently truncate or merge malformed output, and unstripped `<think>` blocks
-compounding across turns. Round two, after the `trtmc`-detokenizer fix
-landed, found: no error handling around the per-turn `trtmc` call/decode
-path (an infrastructure failure -- a crash, timeout, or malformed payload --
-would have taken down the whole process uncaught); a real contract gap
-between `tools.py`'s calculator schema (which advertises unwrapped `<=`/`<`
-comparisons) and `parse.py`'s CDATA requirement for any value containing a
-literal `<` (an unwrapped comparison was silently dropped, not evaluated);
-a fragile string-suffix match for the `<|im_end|>` turn marker instead of a
-token-id-level strip; an unbounded-exponent cost in the calculator evaluated
-before the existing result-size guard ever ran; and a shared-by-reference
-one-shot example list. All fixed (verified against real GPU hardware after
-the fix, not just locally) and covered by regression tests; also caught and
-fixed in this round: a stale `precision_compare.py` example command missing
-a required flag, and a quoted task string that had silently drifted from
-the actual code.
-
-**Round three** (correctness re-verification, a mutation-testing-style test
-audit, and a dedicated security pass) found and fixed further real issues:
-the round-two `trtmc` error handling still didn't catch a wrong-*shaped*
-payload (valid JSON that's the wrong type, or a `token_ids` field that
-isn't a list -- both crashed uncaught with a `TypeError`); the exponent
-guard bounded only the exponent, not the base, so a small, allowed exponent
-on an enormous base (or a chain of nested `**` calls, each individually
-within the cap) was just as expensive to compute as the huge-exponent case
-it was written to stop -- replaced with a guard that estimates the actual
-result size; `web_search` results were fed into the next turn's prompt
-completely unsanitized, and HF fast tokenizers match registered special
-tokens as substrings anywhere in text, so a poisoned search result could in
-principle inject fake turn boundaries or fake tool-call XML -- `web_search`
-now neutralizes those marker substrings before they ever reach `messages`;
-an oversized `write_file` (read back via `read_file` into a later prompt)
-could grow a rendered prompt past the OS's `ARG_MAX`, crashing the
-subprocess call with an uncaught `OSError` -- `write_file` now caps content
-size, and `agent.py` catches `OSError` too. The path-traversal sandboxing
-was independently re-attacked (symlinks, absolute-path joins, percent- and
-Unicode-encoded traversal, null bytes, oversized filenames) and held in
-every case; `subprocess` shell-injection was independently re-attempted and
-confirmed not exploitable (list-form `subprocess.run`, no `shell=True`).
-Re-verified against real GPU hardware after every fix in this round too --
-byte-identical correct output to the pre-fix run, confirming no regression.
-Non-GPU-dependent parts (`parse.py`, `tools.py`, `agent.py`'s orchestration
-logic, `render.py`, `precision_compare.py`'s own arithmetic) are covered by
-84 tests, all passing locally -- up from 56, including tests added via a
-mutation-testing pass (deliberately introducing small real bugs one at a
-time and confirming the suite actually catches each one, not just that it
-currently passes).
+The suite needs no GPU. It covers the parser, tools, loop control flow, and the
+`trtmc` subprocess boundary (against a fake `trtmc` script, including exact
+argv, timeout and malformed output). The tokenizer is stubbed, so the real chat
+template and real special-token decoding are not exercised by the tests.

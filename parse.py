@@ -38,7 +38,12 @@ _CDATA_CLOSE = "]]>"
 
 
 def strip_thinking(text: str) -> str:
-    return _THINK_RE.sub("", text)
+    """Remove <think>...</think> blocks. An unclosed <think> (output cut off
+    mid-reasoning) is removed through the end of the text: reasoning that never
+    finished is not an answer and must not leak into one."""
+    text = _THINK_RE.sub("", text)
+    unclosed = text.find("<think>")
+    return text if unclosed == -1 else text[:unclosed]
 
 
 def _parse_one_param(text: str, pos: int) -> tuple[str, str, int] | None:
@@ -83,7 +88,7 @@ def _parse_one_function(text: str, pos: int) -> tuple[dict, int] | None:
     start_match = _FUNCTION_START_RE.match(text, pos)
     if not start_match:
         return None
-    name = start_match.group(1)
+    name = start_match.group(1).strip()
     scan_pos = start_match.end()
     arguments: dict[str, str] = {}
 

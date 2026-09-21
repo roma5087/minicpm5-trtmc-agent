@@ -9,13 +9,13 @@ rendered prompt by chat_template.jinja.
 from __future__ import annotations
 
 import ast
+import math
 import operator
 from pathlib import Path
 
 from ddgs import DDGS
 
 WORKSPACE = (Path(__file__).resolve().parent / "workspace").resolve()
-WORKSPACE.mkdir(exist_ok=True)
 
 TOOL_SCHEMAS = [
     {
@@ -110,48 +110,58 @@ _ALLOWED_COMPAREOPS = {
 }
 
 
-# Caps the cost of ** before it runs, not after: computing a huge-exponent
-# int result is expensive in itself, well before the existing int-to-str
-# guard (see calculator()'s docstring) ever gets a chance to reject the
-# *result* -- this bounds the *operation*, not just its output.
-#
-# Bounding just the immediate exponent isn't enough on its own -- confirmed
-# two independent ways in review: (1) a chain of nested ** calls, each
-# individually within an exponent-only cap, still blows up, since each
-# level's real result feeds in as the next level's base; (2) a single **
-# with a small, allowed exponent but an enormous *base* (e.g. a ~4300-digit
-# literal) is just as expensive, and an exponent-only check never looks at
-# the base at all. Estimating the *result* size (base's bit length *
-# exponent) instead catches both: it reflects whatever the base actually is,
-# however it was produced, and multiplying by the next exponent gives an
-# accurate cost estimate for the operation about to run.
-_MAX_POW_RESULT_BITS = 20_000  # ~6,000 decimal digits -- comfortably below
-# the point where the existing int-to-str guard would trigger anyway, so
-# this guard fires before real computational cost is spent, not after.
+# Every integer intermediate is capped by size, not just the result of **.
+# Bounding only the exponent is not enough (a huge base, or a chain of nested
+# operations that each stay under an exponent cap, is just as expensive), and
+# ** is not the only quadratic operation: chained multiplication feeding % or
+# // is too. Capping the bit length of every integer that can exist during
+# evaluation bounds the cost of every operation, and the cap is checked before
+# ** and * run (from operand sizes), so no oversized value is ever computed.
+_MAX_INT_BITS = 4_096  # ~1,230 decimal digits
+
+
+def _is_plain_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_int_size(value, what: str):
+    if _is_plain_int(value) and value.bit_length() > _MAX_INT_BITS:
+        raise ValueError(f"{what} too large: ~{value.bit_length()} bits (max {_MAX_INT_BITS})")
+    return value
+
+
+def _reject_bool(value):
+    # A comparison's True/False must not silently become 1/0 in arithmetic
+    # (e.g. "(1 < 2) + 1" == 2) -- that is never what the caller meant.
+    if isinstance(value, bool):
+        raise ValueError("a comparison result cannot be used as a number")
+    return value
 
 
 def _eval_node(node: ast.AST) -> float | bool:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return node.value
+        return _check_int_size(node.value, "number")
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-        left = _eval_node(node.left)
-        right = _eval_node(node.right)
-        if isinstance(node.op, ast.Pow):
-            # Only int**int can actually blow up like this: float exponents
-            # (or a float base) go through IEEE-754 arithmetic, which raises
-            # OverflowError on its own long before consuming pathological
-            # memory -- Python bignums are the only side with no built-in cap.
-            is_plain_int = lambda v: isinstance(v, int) and not isinstance(v, bool)
-            if is_plain_int(left) and is_plain_int(right) and right > 1 and abs(left) > 1:
+        left = _reject_bool(_eval_node(node.left))
+        right = _reject_bool(_eval_node(node.right))
+        if _is_plain_int(left) and _is_plain_int(right):
+            if isinstance(node.op, ast.Pow) and right > 1 and abs(left) > 1:
                 estimated_bits = left.bit_length() * right
-                if estimated_bits > _MAX_POW_RESULT_BITS:
+                if estimated_bits > _MAX_INT_BITS:
                     raise ValueError(f"estimated result too large: ~{estimated_bits} bits")
-        return _ALLOWED_BINOPS[type(node.op)](left, right)
+            elif isinstance(node.op, ast.Mult):
+                estimated_bits = left.bit_length() + right.bit_length()
+                if estimated_bits > _MAX_INT_BITS:
+                    raise ValueError(f"estimated result too large: ~{estimated_bits} bits")
+        result = _ALLOWED_BINOPS[type(node.op)](left, right)
+        if isinstance(result, float) and not math.isfinite(result):
+            raise ValueError("result is not a finite number")
+        return _check_int_size(result, "result")
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
-        return _ALLOWED_UNARYOPS[type(node.op)](_eval_node(node.operand))
+        return _ALLOWED_UNARYOPS[type(node.op)](_reject_bool(_eval_node(node.operand)))
     if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _ALLOWED_COMPAREOPS:
-        left = _eval_node(node.left)
-        right = _eval_node(node.comparators[0])
+        left = _reject_bool(_eval_node(node.left))
+        right = _reject_bool(_eval_node(node.comparators[0]))
         return _ALLOWED_COMPAREOPS[type(node.ops[0])](left, right)
     raise ValueError(f"disallowed expression element: {ast.dump(node)}")
 
@@ -167,7 +177,7 @@ def calculator(expression: str) -> str:
     recognizes failures that come back that way.
     """
     try:
-        tree = ast.parse(expression, mode="eval")
+        tree = ast.parse(expression.strip(), mode="eval")
         result = _eval_node(tree.body)
         return str(result)
     except Exception as error:
@@ -205,6 +215,25 @@ def _neutralize_markers(text: str) -> str:
     return text
 
 
+def sanitize_tool_result(text: str, added_tokens=()) -> str:
+    """Make untrusted text safe to place inside a <tool_response> turn.
+
+    Applied to every tool result at the one place they enter the prompt, not
+    inside individual tools. trtmc's encoder matches *every* added token
+    (special or not) as a substring anywhere in the prompt text, so the token
+    list comes from the tokenizer itself rather than a hand-kept list. A
+    zero-width space after the first character breaks the match without
+    changing how the text reads. Also removes what would crash the subprocess
+    call (NUL bytes, lone surrogates).
+    """
+    text = _neutralize_markers(text)
+    for token in sorted(added_tokens, key=len, reverse=True):
+        if len(token) > 1 and token in text:
+            text = text.replace(token, token[0] + "\u200b" + token[1:])
+    text = text.replace("\x00", "")
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def web_search(query: str, max_results: int = 4) -> str:
     try:
         with DDGS() as ddgs:
@@ -222,6 +251,10 @@ def web_search(query: str, max_results: int = 4) -> str:
 
 
 def _resolve_in_workspace(filename: str) -> Path:
+    filename = filename.strip()
+    if filename.startswith("."):
+        # Keeps the tracked workspace/.gitkeep (and any dotfile) out of reach.
+        raise ValueError(f"filenames may not start with '.': {filename!r}")
     candidate = (WORKSPACE / filename).resolve()
     # candidate == WORKSPACE (e.g. filename="." or "") is rejected too: a
     # tool call must always name a file *within* the workspace, never the
@@ -242,11 +275,16 @@ _MAX_WRITE_FILE_CONTENT_BYTES = 200_000
 
 
 def write_file(filename: str, content: str) -> str:
-    if len(content.encode("utf-8")) > _MAX_WRITE_FILE_CONTENT_BYTES:
-        return f"error: content too large ({len(content)} chars, max {_MAX_WRITE_FILE_CONTENT_BYTES} bytes)"
+    try:
+        encoded = content.encode("utf-8")
+    except UnicodeEncodeError as error:
+        return f"error: content is not valid text: {error.reason}"
+    if len(encoded) > _MAX_WRITE_FILE_CONTENT_BYTES:
+        return f"error: content too large ({len(encoded)} bytes, max {_MAX_WRITE_FILE_CONTENT_BYTES})"
     try:
         path = _resolve_in_workspace(filename)
-        path.write_text(content, encoding="utf-8")
+        WORKSPACE.mkdir(exist_ok=True)
+        path.write_bytes(encoded)
     except ValueError as error:
         return f"error: {error}"
     except OSError as error:
@@ -256,7 +294,7 @@ def write_file(filename: str, content: str) -> str:
         # back into the model's context. Report the OS-level reason and the
         # filename the caller actually asked for, not the resolved path.
         return f"error: could not write {filename!r}: {error.strerror or error}"
-    return f"saved {len(content)} bytes to {path.name}"
+    return f"saved {len(encoded)} bytes to {path.name}"
 
 
 def read_file(filename: str) -> str:

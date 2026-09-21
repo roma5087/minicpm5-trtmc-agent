@@ -119,6 +119,10 @@ def test_main_handles_zero_ms_per_token_without_dividing_by_zero(monkeypatch, ca
             "decode_ms_avg": 0.0,
             "ms_per_token_avg": 0.0,
             "ms_per_token_stdev": 0.0,
+            "ms_per_token_median": 0.0,
+            "ms_per_token_min": 0.0,
+            "ms_per_token_runs": [0.0],
+            "token_counts": [1],
             "runs": 1,
         },
     )

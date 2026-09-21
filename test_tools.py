@@ -160,12 +160,10 @@ def test_calculator_supports_floor_division_and_modulo():
 
 def test_calculator_exponent_guard_boundary_is_exact():
     # The guard estimates result size as base.bit_length() * exponent and
-    # rejects anything over 20,000 bits -- for base 2 (bit_length 2) that
-    # boundary lands at exactly exponent 10,000, which this pins exactly
-    # (only far-above/far-below values were tested before, never the
-    # boundary itself; changing ">" to ">=" left the full suite green).
-    assert not calculator("2**10000").startswith("error:")
-    assert calculator("2**10001").startswith("error:")
+    # rejects anything over 4,096 bits -- for base 2 (bit_length 2) that
+    # boundary lands at exactly exponent 2,048, which this pins exactly.
+    assert not calculator("2**2048").startswith("error:")
+    assert calculator("2**2049").startswith("error:")
 
 
 def test_calculator_rejects_huge_base_with_small_allowed_exponent():

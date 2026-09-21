@@ -19,7 +19,7 @@ _IM_END_SENTINEL = "STUB_IM_END_TOKEN_ID"
 class _StubTokenizer:
     """agent.py decodes token_ids itself now (trtmc's own text field silently
     drops MiniCPM5's <function>/<param>/</function> special tokens -- see
-    README "Results"). This stub carries the intended text as the first
+    README "The trtmc finding"). This stub carries the intended text as the first
     token_ids entry and unwraps it, so tests keep controlling output via
     plain strings without needing real token ids."""
 
@@ -195,7 +195,7 @@ def test_think_block_stripped_before_entering_history(monkeypatch):
 
     agent.run_agent(
         model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
-        runtime_root=Path("."), task="do something", verbose=False,
+        runtime_root=Path("."), task="do something", verbose=False, include_example=False,
     )
     # The second render call sees the first turn's assistant message in
     # history -- it must not contain the <think> block.
@@ -248,7 +248,23 @@ def test_include_example_prepends_the_one_shot_before_the_real_task(monkeypatch)
     ]
 
 
-def test_no_example_by_default(monkeypatch):
+def test_example_is_included_by_default(monkeypatch):
+    _mock_common(monkeypatch)
+    monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: _payload("final answer"))
+    captured_messages = []
+    monkeypatch.setattr(
+        agent, "render_prompt",
+        lambda tokenizer, messages, tools: captured_messages.append([dict(m) for m in messages]) or "RENDERED_PROMPT",
+    )
+    agent.run_agent(
+        model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
+        runtime_root=Path("."), task="the real task", verbose=False,
+    )
+    assert captured_messages[0][1:5] == agent.ONE_SHOT_EXAMPLE
+    assert captured_messages[0][-1] == {"role": "user", "content": "the real task"}
+
+
+def test_no_example_when_disabled(monkeypatch):
     _mock_common(monkeypatch)
     monkeypatch.setattr(agent, "run_trtmc", lambda *a, **k: _payload("final answer"))
     captured_messages = []
@@ -259,7 +275,7 @@ def test_no_example_by_default(monkeypatch):
 
     agent.run_agent(
         model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
-        runtime_root=Path("."), task="the real task", verbose=False,
+        runtime_root=Path("."), task="the real task", verbose=False, include_example=False,
     )
     assert captured_messages[0] == [
         {"role": "system", "content": "You are a helpful assistant with access to tools."},
@@ -301,7 +317,7 @@ def test_trailing_im_end_marker_does_not_break_tool_call_parsing_or_leak_into_hi
 
     answer, perf = agent.run_agent(
         model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
-        runtime_root=Path("."), task="what is 2+2", verbose=False,
+        runtime_root=Path("."), task="what is 2+2", verbose=False, include_example=False,
     )
     assert answer == "done"
     assert perf.turns == 2
@@ -542,7 +558,7 @@ def test_empty_token_ids_list_does_not_index_error_checking_for_im_end(monkeypat
         model_dir="unused", binary=Path("trtmc"), bundle=Path("b.bundle"),
         runtime_root=Path("."), task="do something", verbose=False,
     )
-    assert answer == ""
+    assert answer == "error: model produced an empty answer"
     assert perf.turns == 1
 
 

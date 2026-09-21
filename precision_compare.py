@@ -25,30 +25,14 @@ different prompt structure per precision, undermining the comparison.
 from __future__ import annotations
 
 import argparse
-import json
 import statistics
-import subprocess
 from pathlib import Path
 
+from engine import run_trtmc
 from render import load_tokenizer, render_prompt
 
 
-def run_once(binary: Path, bundle: Path, runtime_root: Path, prompt: str, max_new_tokens: int) -> dict:
-    command = [
-        str(binary),
-        "run",
-        str(bundle),
-        "--runtime-root",
-        str(runtime_root),
-        "--prompt",
-        prompt,
-        "--max-new-tokens",
-        str(max_new_tokens),
-        "--use-chat-template",
-        "false",
-    ]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=True)
-    return json.loads(completed.stdout)
+run_once = run_trtmc
 
 
 def measure(
@@ -64,7 +48,7 @@ def measure(
     if repeats > 1:
         run_once(binary, bundle, runtime_root, prompt, max_new_tokens)
 
-    prefill_ms, decode_ms, ms_per_token = [], [], []
+    prefill_ms, decode_ms, ms_per_token, token_counts = [], [], [], []
     for i in range(repeats):
         payload = run_once(binary, bundle, runtime_root, prompt, max_new_tokens)
         try:
@@ -72,6 +56,7 @@ def measure(
             prefill_ms.append(payload["prefill_ms"])
             decode_ms.append(payload["decode_ms"])
             ms_per_token.append(payload["decode_ms"] / tokens)
+            token_counts.append(tokens)
         except KeyError as error:
             # A malformed/unexpected trtmc payload mid-run (e.g. an error
             # response instead of the expected timing fields) should say
@@ -86,6 +71,10 @@ def measure(
         "decode_ms_avg": statistics.mean(decode_ms),
         "ms_per_token_avg": statistics.mean(ms_per_token),
         "ms_per_token_stdev": statistics.stdev(ms_per_token) if repeats > 1 else 0.0,
+        "ms_per_token_median": statistics.median(ms_per_token),
+        "ms_per_token_min": min(ms_per_token),
+        "ms_per_token_runs": ms_per_token,
+        "token_counts": token_counts,
         "runs": repeats,
     }
 
@@ -130,6 +119,23 @@ def main() -> None:
             f"{label:10}{r['prefill_ms_avg']:>14.2f}{r['decode_ms_avg']:>14.2f}"
             f"{r['ms_per_token_avg']:>14.3f}{r['ms_per_token_stdev']:>10.3f}"
         )
+
+    print("\nraw ms/token per run:")
+    for label, r in results.items():
+        print(f"  {label}: " + ", ".join(f"{v:.3f}" for v in r["ms_per_token_runs"]))
+    counts = {label: sorted(set(r["token_counts"])) for label, r in results.items()}
+    print(f"tokens generated per run: {counts}")
+    if counts["bf16"] != counts["fp16"] or any(len(c) > 1 for c in counts.values()):
+        print(
+            "WARNING: token counts differ between runs/precisions, so ms/token is being "
+            "compared over different amounts of work."
+        )
+    print(
+        "note: every invocation is a fresh process, so prefill_ms on a short prompt is "
+        "dominated by per-process start-up cost, not prefill compute; and the two bundles "
+        "are separate engine builds, so a gap here is not shown to be a precision effect "
+        "(build each precision twice to measure build-to-build variance)."
+    )
 
     bf16_ms, fp16_ms = results["bf16"]["ms_per_token_avg"], results["fp16"]["ms_per_token_avg"]
     if bf16_ms <= 0 or fp16_ms <= 0:
