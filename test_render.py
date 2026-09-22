@@ -10,8 +10,10 @@ from render import render_prompt
 
 
 class _StubTokenizer:
-    def __init__(self):
+    def __init__(self, template_output="RENDERED", bos_token=None):
         self.calls = []
+        self.bos_token = bos_token
+        self._template_output = template_output
 
     def apply_chat_template(self, messages, tools=None, tokenize=None, add_generation_prompt=None):
         self.calls.append(
@@ -22,7 +24,7 @@ class _StubTokenizer:
                 "add_generation_prompt": add_generation_prompt,
             }
         )
-        return "RENDERED"
+        return self._template_output
 
 
 def test_render_prompt_returns_the_template_output_verbatim():
@@ -51,6 +53,36 @@ def test_render_prompt_requests_untokenized_text_with_generation_prompt():
     call = tokenizer.calls[0]
     assert call["tokenize"] is False
     assert call["add_generation_prompt"] is True
+
+
+def test_render_prompt_strips_one_leading_bos_token():
+    # trtmc's own CLI adds one BOS id by default on every --prompt call; a
+    # literal bos_token left in the text becomes a second, genuine BOS in the
+    # ids trtmc actually runs (see README "The trtmc findings"). Stripping our
+    # own copy leaves exactly the one trtmc adds.
+    tokenizer = _StubTokenizer(template_output="<s><|im_start|>system\nhi", bos_token="<s>")
+    result = render_prompt(tokenizer, [], tools=[])
+    assert result == "<|im_start|>system\nhi"
+
+
+def test_render_prompt_leaves_text_alone_when_it_does_not_start_with_bos_token():
+    tokenizer = _StubTokenizer(template_output="<|im_start|>system\nhi", bos_token="<s>")
+    result = render_prompt(tokenizer, [], tools=[])
+    assert result == "<|im_start|>system\nhi"
+
+
+def test_render_prompt_leaves_text_alone_when_tokenizer_has_no_bos_token():
+    tokenizer = _StubTokenizer(template_output="<s><|im_start|>system\nhi", bos_token=None)
+    result = render_prompt(tokenizer, [], tools=[])
+    assert result == "<s><|im_start|>system\nhi"
+
+
+def test_render_prompt_only_strips_the_leading_bos_token_not_others_later_in_the_text():
+    # A literal "<s>" that appears later (e.g. quoted inside message content)
+    # must not be touched -- only the one the template puts at the very start.
+    tokenizer = _StubTokenizer(template_output="<s>a<s>b", bos_token="<s>")
+    result = render_prompt(tokenizer, [], tools=[])
+    assert result == "a<s>b"
 
 
 def test_load_tokenizer_disables_trust_remote_code(monkeypatch):

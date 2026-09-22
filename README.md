@@ -21,7 +21,7 @@ reloads the engine from disk.
 
 | file | role |
 |---|---|
-| `render.py` | Renders the whole conversation plus tool schemas with the checkpoint's own Jinja chat template (via `transformers`) and passes the finished text to `trtmc run --use-chat-template false`, instead of relying on the runtime's template detection. |
+| `render.py` | Renders the whole conversation plus tool schemas with the checkpoint's own Jinja chat template (via `transformers`) and passes the finished text to `trtmc run --use-chat-template false`, instead of relying on the runtime's template detection. Strips its own leading BOS token first (see "The trtmc findings"). |
 | `parse.py` | Position-based scanner for MiniCPM5's `<function name=…><param name=…>…</param></function>` calls. A block that is malformed part-way is dropped, never guessed at; a whole-string regex would silently truncate a CDATA value containing `</param>` or merge two overlapping calls. |
 | `tools.py` | `web_search` (ddgs), `calculator`, `write_file`, `read_file`. The calculator is an AST-restricted evaluator (never `eval`) supporting arithmetic and single comparisons, with every integer intermediate capped at 4,096 bits. File tools are confined to `workspace/`. |
 | `engine.py` | One `trtmc run` call: argv, timeout, JSON parsing. Failures raise `EngineError` carrying the exit status and stderr tail, not the command line (which embeds the whole prompt). |
@@ -100,11 +100,16 @@ id sequences were aligned with `difflib.SequenceMatcher`.
 **Result:** HF encodes the prompt to 826 ids; `trtmc` encodes the identical
 text to 851. The alignment shows two distinct problems:
 
-1. **A genuine double leading BOS.** HF: `[0, 130072, ...]`. `trtmc`: `[0, 0,
-   130072, ...]`. The rendered prompt already contains a literal `<s>` from
-   the template's own `{{- bos_token }}`; `trtmc`'s encoder matches that
-   substring as its own token *and* separately prepends a BOS by default,
-   producing two.
+1. **A genuine double leading BOS -- fixed here, on 2026-09-22.** HF: `[0,
+   130072, ...]`. `trtmc`: `[0, 0, 130072, ...]`. The rendered prompt already
+   contains a literal `<s>` from the template's own `{{- bos_token }}`;
+   `trtmc`'s encoder matches that substring as its own token *and* separately
+   prepends a BOS by default, producing two. `render.py` now strips its own
+   leading `<s>` before handing the text to `trtmc`, leaving only `trtmc`'s
+   own auto-added BOS -- verified directly: `trtmc`'s real encoded id count
+   for the same prompt dropped from 851 to 850, and the sequence now starts
+   with a single `0`, matching HF. This is the one part of the encode finding
+   fixable from this project's own code; the rest is not (see below).
 2. **31 places where HF merges two characters into one vocab token and
    `trtmc` does not**, scattered through the whole prompt, not clustered
    anywhere in particular. Representative examples (decoded):
@@ -156,12 +161,25 @@ one -- and never looks at the second. The digit regex matches none of
 `variant=0` (`kLlama`) for this checkpoint, when the checkpoint's actual
 second `Split` regex should classify as `kQwen3` (`variant=1`) on its own.
 
-This is a precise, one-line-fixable bug (scan every `Split` step for one
-`classify_split()` recognizes, instead of returning on the first), but it is
-not fixed here and not filed upstream -- this project only diagnosed it.
-Whether it measurably changes model behavior, versus being a difference the
-model tolerates, is also unverified: the agent still completes its task
-correctly despite it, in every run so far.
+This is a precise, one-line-fixable bug on `trtmc`'s side (scan every `Split`
+step for one `classify_split()` recognizes, instead of returning on the
+first), but it cannot be fixed from this project: `trtmc run` does not expose
+a way to hand it already-tokenized ids instead of raw text for this bundle
+type. `--token-ids` exists as a CLI option and is checked directly (also
+2026-09-22): it is explicitly rejected --
+`Error: --token-ids requires an explicit Task SDK contract, not the existing
+interface` -- for the "existing bundle mode" `families/llama` uses (the one
+that needs `--runtime-root`, confirmed by reading `apps/cli/cli.cpp`'s
+`dispatch()`/`dispatch_run()`). So the only real fix is the one-line change
+inside `bpe_tokenizer.cpp` itself, and it is not made or filed upstream here
+-- this project diagnosed it, and fixed the one piece (the BOS) that its own
+code could reach. Whether the remaining under-merging measurably changes
+model behavior, versus being a difference the model tolerates, is also
+unverified: the agent still completes its task correctly despite it, in
+every run so far, including the run after the BOS fix -- re-run with the
+fixed `render.py` (same task, same `--max-new-tokens 1024`, bf16), still 4
+turns, still no crash or malformed call, still the correct A40
+recommendation.
 
 ## Results
 
@@ -333,12 +351,15 @@ snippets.
 - **Per-turn reload cost is measured and is the dominant cost** (see Results):
   65% of one run's wall time was outside prefill/decode. A persistent-server
   runtime, not available for `trtmc` today, would be the fix.
-- **Encode-side parity is checked, broken, and root-caused** (see "The trtmc
-  findings" above): `trtmc`'s encoder produces 851 ids for a prompt HF encodes
-  to 826, including a double leading BOS and 31 places where a merge HF
-  applies is missing, traced to a one-line pretokenizer-variant-detection bug.
-  Not fixed here, not filed upstream. Whether it changes model behavior, not
-  just token count, is unverified.
+- **Encode-side parity is checked, broken, root-caused, and partly fixed**
+  (see "The trtmc findings" above): `trtmc`'s encoder produced 851 ids for a
+  prompt HF encodes to 826, traced to a one-line pretokenizer-variant-
+  detection bug. The double leading BOS (one of the 25 extra ids) is fixed in
+  `render.py`, verified directly (851 -> 850). The other ~24 (BPE
+  under-merging) cannot be fixed from this project -- `trtmc run` has no way
+  to accept pre-tokenized ids for this bundle type (`--token-ids` is checked
+  and explicitly rejected) -- and are not fixed here or filed upstream.
+  Whether they change model behavior, not just token count, is unverified.
 - **Tool results are formatted as one `user` turn per call**
   (`<tool_response>…</tool_response>`), confirmed to differ from the
   template's own `tool` role (see Further checks); a single run with the

@@ -19,9 +19,22 @@ def load_tokenizer(model_dir: str):
 
 
 def render_prompt(tokenizer, messages: list[dict], tools: list[dict]) -> str:
-    return tokenizer.apply_chat_template(
+    prompt = tokenizer.apply_chat_template(
         messages,
         tools=tools,
         tokenize=False,
         add_generation_prompt=True,
     )
+    # The template's own {{- bos_token }} puts a literal "<s>" at the start of
+    # the text. trtmc's CLI adds its own BOS id by default on every --prompt
+    # invocation, on top of whatever `trtmc`'s encoder matches in the text
+    # itself -- so a literal "<s>" here becomes a genuine double BOS in the
+    # ids trtmc actually runs (confirmed directly: see README "The trtmc
+    # findings"). Stripping our own copy leaves trtmc's one auto-added BOS,
+    # matching HF's own encoding of this text. This fixes one of the encode
+    # mismatches found there; the other (BPE under-merging elsewhere in the
+    # prompt) is not fixable from this side -- it needs a trtmc source change.
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if bos_token and prompt.startswith(bos_token):
+        prompt = prompt[len(bos_token):]
+    return prompt
