@@ -51,7 +51,15 @@ Behaviours of the loop worth knowing:
 - An optional one-shot example of a full tool-call round trip is on by default
   (`--no-example` to disable).
 
-## The trtmc finding
+## The trtmc findings
+
+Two separate, real issues were found in `trtmc`'s own tokenizer code this
+project depends on -- one on the decode side (found first, worked around from
+the start), one on the encode side (found later, on 2026-09-22, not yet
+worked around). They are independent: fixing one says nothing about the
+other.
+
+### Decode: special tokens are silently dropped from `text`
 
 Early runs produced malformed tool calls: the literal `<function` / `<param`
 tags were missing from the text, leaving only `name="…"` fragments. Comparing
@@ -64,12 +72,71 @@ described in the source as controlling "decode filtering". MiniCPM5 flags
 `<function`, `</function>`, `<param`, `</param>` (ids 18–21) and `<|im_end|>`
 (130073) as special; `<think>` and `</think>` (8, 9) are not flagged, which is
 why reasoning survives in `text` and tool calls do not. Encode, by contrast,
-matches all added tokens, special or not, as substrings.
+matches all added tokens, special or not, as substrings (see below).
 
 So this is a design default with no opt-out (the equivalent of
 `skip_special_tokens=True`), not corruption. For a model whose tool-call tags
 are special tokens, `token_ids` is the interface to use. `agent.py` does that
 and needs no change to TensorRT-Model-Connect. It is not filed upstream.
+
+### Encode: `trtmc`'s BPE encoder under-merges relative to the real tokenizer
+
+`agent.py` renders the prompt with HF's own tokenizer and hands `trtmc` the
+finished text via `--prompt`, on the assumption that `trtmc`'s own encoder
+then tokenizes that text the same way HF would. That assumption was checked
+directly on 2026-09-22 and is false.
+
+**Method:** a one-line debug print was added locally to `encode()` in
+`families/llama/runtime/bpe_tokenizer.cpp` (env-var gated, dumping the
+returned id vector to stderr as JSON), and just `trtmc_model_llama` was
+rebuilt with it. This is instance-local instrumentation, never committed or
+pushed anywhere -- it exists only to answer the question, not as a proposed
+change. The real 826-token first-turn prompt from `DEFAULT_TASK` (rendered by
+`render.py`, exactly what `agent.py` sends) was run through both `trtmc run
+--prompt "$PROMPT"` (with the debug env var set) and, separately,
+`tokenizer(prompt, add_special_tokens=False).input_ids` in Python, and the two
+id sequences were aligned with `difflib.SequenceMatcher`.
+
+**Result:** HF encodes the prompt to 826 ids; `trtmc` encodes the identical
+text to 851. The alignment shows two distinct problems:
+
+1. **A genuine double leading BOS.** HF: `[0, 130072, ...]`. `trtmc`: `[0, 0,
+   130072, ...]`. The rendered prompt already contains a literal `<s>` from
+   the template's own `{{- bos_token }}`; `trtmc`'s encoder matches that
+   substring as its own token *and* separately prepends a BOS by default,
+   producing two.
+2. **31 places where HF merges two characters into one vocab token and
+   `trtmc` does not**, scattered through the whole prompt, not clustered
+   anywhere in particular. Representative examples (decoded):
+
+   | text | HF (1 token) | trtmc (2 tokens) |
+   |---|---|---|
+   | `.` + newline | `350` | `35` (`.`) + `220` (newline) |
+   | `:` + newline | `990` | `47` (`:`) + `220` |
+   | `_search` | `72903` | `84` (`_`) + `14875` (`search`) |
+   | `.g` | `2587` | `35` (`.`) + `92` (`g`) |
+   | `-name` | `35768` | `34` (`-`) + `2075` (`name`) |
+   | `}}}` + newline | `113927` | `16570` (`}}}`) + `220` |
+
+   Two of the 31 mismatches are a different shape: HF and `trtmc` both use two
+   tokens for the same text (e.g. `-wrapped`, `6000`), just split at a
+   different point (`3248`+`39996` vs `34`+`112403` for `-wrapped`). Not a
+   clean merge loss like the six above, but still a real divergence in what
+   ids the model actually receives.
+
+`trtmc`'s BPE encoder is not just mishandling special tokens (the decode
+finding above) -- it is systematically **under-merging plain text** relative
+to the checkpoint's real tokenizer. This means every prompt this project has
+ever sent to `trtmc`, on every turn, differs from what MiniCPM5-2B's own
+tokenizer would have produced for the same text. The root cause has not been
+diagnosed (a pre-tokenization split-boundary mismatch is consistent with the
+pattern -- every example above is a merge across what looks like a
+regex-driven pretokenizer split point -- but this is not confirmed by reading
+the encoder's pretokenization code, only inferred from the symptom). Not
+fixed here, not filed upstream. Whether it measurably changes model behavior
+(versus being a difference TensorRT-Model-Connect's own detokenization of the
+*output* happens not to expose) is also unverified -- the agent still
+completes its task correctly despite it, in every run so far.
 
 ## Results
 
@@ -130,9 +197,10 @@ cosmetic, still doesn't touch the recommendation. It is one more data point
 that this model's transcription of a correct number, not its arithmetic or
 tool use, is the least reliable part of the pipeline.
 
-Not done on this run: building each precision twice to isolate build-to-build
-variance, and comparing the model's own budget reasoning (it never explicitly
-checked the $10,000 figure against any price, though all three now fit).
+Not done on this run: comparing the model's own budget reasoning (it never
+explicitly checked the $10,000 figure against any price, though all three now
+fit). Build-to-build variance was checked as a separate follow-up -- see
+"Further checks" below.
 
 **Original run (2026-09-16), pre-hardening code, A100-SXM4-40GB** (driver
 570.148.08, CUDA 13.3 NGC image via forward compatibility). Kept for context;
@@ -163,6 +231,59 @@ sourced or checked against datasheets, and are labeled "dense FP16 TFLOPS" in
 the task text without confirming all three cards are being compared on the
 same execution path -- the recommendation is only as good as those inputs.
 
+## Further checks (2026-09-22)
+
+Three more checks were run on the same A100-SXM4-80GB, following up on items
+the Results and Limitations sections above had left open. (The fourth
+follow-up, encode-side parity, produced the encoder finding above and is
+documented there, not here.)
+
+**Build-to-build variance, to check whether the ~4% bf16/fp16 gap is a real
+precision effect.** Each precision was built a second time from the same
+checkpoint and compared against its own first build:
+
+| comparison | ms/token (v1) | ms/token (v2) | ratio |
+|---|---|---|---|
+| bf16 vs bf16 | 13.718 | 13.879 | 1.01x |
+| fp16 vs fp16 | 13.245 | 13.147 | 1.01x |
+
+Same-precision build variance is ~1%, well under the ~4% bf16/fp16 gap seen
+on both GPUs in the Results above. That is evidence the precision gap is a
+real effect, not two engine builds that happen to differ -- though it is
+still only two builds per precision, not a distribution.
+
+**An HF baseline** (not vLLM/SGLang -- scoped down to a plain
+`transformers.generate()` call for cost and time; the vLLM/SGLang comparison
+is still not done): bf16, greedy, the same prompt and GPU as
+`precision_compare.py`, prefill timed separately from decode the same way
+`trtmc` reports the two:
+
+| | ms/token (decode-only) |
+|---|---|
+| HF `generate()`, eager, bf16, greedy | 19.150 |
+| `trtmc`, this session's runs | 13.147 - 13.879 |
+
+`trtmc` is meaningfully faster than naive HF eager mode (roughly 1.4x), which
+is a real result this project didn't have before. It does not answer whether
+13-14 ms/token is *good* -- that needs the memory-bandwidth-floor estimate and
+profiling the Limitations section below still asks for, and neither HF eager
+nor `trtmc` here uses CUDA graphs or a KV-cache-optimized serving stack, so
+neither number is a ceiling on what's achievable.
+
+**The native `tool`-role format, read directly from
+`chat_template.jinja`:** `role: "tool"` messages merge consecutive results
+into one `<|im_start|>user...<|im_end|>` block, with `\n` around each
+`<tool_response>...</tool_response>`, only opening/closing that block at a
+run of consecutive tool messages. The shipped code's `role: "user"` +
+manually-wrapped `<tool_response>` produces one such block per call instead.
+A 2-line variant using `role: "tool"` (not shipped; instance-local only) ran
+the real default task once: completed correctly in 4 turns, same A40
+recommendation, no crash, no malformed call. Turn-by-turn prompt token counts
+were close to the shipped format's (within a few dozen tokens either way,
+confounded by the model's own output length differing turn to turn once the
+input format changes). One run each is not enough to say whether either
+format is more reliable -- it says only that the native format also works.
+
 ## Task
 
 `DEFAULT_TASK` in `agent.py` asks for a three-GPU comparison under a budget:
@@ -174,8 +295,10 @@ snippets.
 
 ## Limitations and open questions
 
-- **No baseline.** Nothing here compares against HF `generate`, vLLM or SGLang
-  on the same GPU, so the numbers say nothing about how the runtime compares.
+- **A plain HF eager baseline exists (see Further checks); vLLM/SGLang do
+  not.** `trtmc` is ~1.4x faster than naive HF `generate()`, but nothing here
+  compares against a real serving stack, so the numbers still say little about
+  how competitive the runtime actually is.
 - **The ~13-14 ms/token decode figure (both GPUs, both runs) has not been
   explained.** It has not been compared with the memory-bandwidth floor for
   this model's weights on either GPU, and nothing has been profiled, so it is
@@ -185,15 +308,16 @@ snippets.
 - **Per-turn reload cost is measured and is the dominant cost** (see Results):
   65% of one run's wall time was outside prefill/decode. A persistent-server
   runtime, not available for `trtmc` today, would be the fix.
-- **Encode-side parity is unchecked.** The prompt is rendered by HF but
-  tokenized by `trtmc`'s C++ BPE. Whether both produce identical ids (a
-  double BOS, special-token matching, pre-tokenizer differences) has not been
-  verified; the fix for decode says nothing about encode.
+- **Encode-side parity is checked and broken** (see "The trtmc findings"
+  above): `trtmc`'s encoder produces 851 ids for a prompt HF encodes to 826,
+  including a double leading BOS and 31 places where a merge HF applies is
+  missing. Root cause not diagnosed, not fixed, not filed upstream. Whether it
+  changes model behavior, not just token count, is unverified.
 - **Tool results are formatted as one `user` turn per call**
-  (`<tool_response>…</tool_response>`), which differs from the template's own
-  `tool` role (newlines around the content, consecutive results grouped in one
-  turn). The model may have been trained on the latter; the effect is
-  unmeasured.
+  (`<tool_response>…</tool_response>`), confirmed to differ from the
+  template's own `tool` role (see Further checks); a single run with the
+  native format also worked, but one run each does not show which is more
+  reliable.
 - Sampling parameters are not passed to `trtmc`; whether it decodes greedily
   by default is not documented here.
 - Tool-call parsing is matched to MiniCPM5's template, not general.
@@ -202,9 +326,10 @@ snippets.
 - Sanitization is pattern-based and validated only against HF's tokenizer
   behaviour and `trtmc`'s source, not end to end on a GPU.
 - `precision_compare.py` runs all bf16 invocations before all fp16 ones rather
-  than interleaving them, and each precision has been built only once, so the
-  ~4% bf16/fp16 gap (reproduced on two separate GPUs now) is still not shown
-  to be a precision effect rather than build-to-build variance.
+  than interleaving them. Each precision has now been built twice (see Further
+  checks): same-precision variance is ~1%, well under the ~4% bf16/fp16 gap,
+  which supports the gap being a real precision effect -- but it is still only
+  two builds per precision, not a distribution.
 - The model has never used the calculator to check the task's own budget
   figure against a price; the current task's budget happens to be satisfied
   by all three cards, so this has not yet mattered to the answer.
