@@ -73,33 +73,76 @@ and needs no change to TensorRT-Model-Connect. It is not filed upstream.
 
 ## Results
 
-One run each, on a rented A100-SXM4-40GB (driver 570.148.08, CUDA 13.3 NGC
-image via forward compatibility), `families/llama` built from `upstream/main`
-at the commit that merged #1288, both bundles `max_sequence_length=4096`,
-`tensor_parallel_size=1`, no quantization. **These were recorded before the
-loop changes described above and have not been re-run.**
+Two runs exist, on different GPUs, and are reported separately rather than
+merged, since the hardware and the code both differ between them.
 
-**bf16 vs fp16** (`precision_compare.py`, "Explain what a KV cache does in one
-paragraph.", `max_new_tokens=64`, 5 runs after one discarded warmup):
+**Current run (2026-09-22), post-hardening code, A100-SXM4-80GB** (driver
+580.126.09, CUDA 13.3), `families/llama` built from `upstream/main` at the
+commit that merged #1288, both bundles `max_sequence_length=4096`,
+`tensor_parallel_size=1`, no quantization.
+
+`precision_compare.py` ("Explain what a KV cache does in one paragraph.",
+`max_new_tokens=64`, 5 runs after one discarded warmup):
+
+| precision | prefill_ms | decode_ms | ms/token | stdev |
+|---|---|---|---|---|
+| bf16 | 69.52 | 880.56 | 13.759 | 0.113 |
+| fp16 | 91.02 | 843.85 | 13.185 | 0.046 |
+
+fp16 ~1.04x faster per token, the same ratio as the original 40GB run below,
+on different hardware. Both precisions generated exactly 64 tokens per run (no
+token-count confound). The caveats below still apply: this is two separate
+engine builds run in sequence, not shown to isolate a precision effect, and
+`prefill_ms` on a ~15-token prompt in a fresh process is dominated by
+start-up cost, not prefill compute (see the note the script itself prints).
+
+Agent run (`--max-new-tokens 1024`, bf16), full output:
+
+```
+engine invocations : 4 (one per turn -- trtmc has no server mode)
+total setup time   : 0.00 ms
+total prefill time : 594.37 ms
+total decode time  : 16342.30 ms across 1191 tokens
+avg decode/token   : 13.721 ms
+total wall time    : 48441.17 ms
+outside prefill/decode : 31504.51 ms (process start, engine load, JSON)
+```
+
+**This answers the previously-open question about per-turn reload cost: it is
+the dominant cost.** 31.5 of 48.4 seconds of wall time (65%) was spent outside
+prefill and decode -- process start, engine deserialization, CUDA context
+setup -- not model compute. The per-turn-subprocess architecture, not the
+model, is what a real deployment would need to fix first.
+
+Four turns, no crashes, no malformed call, no fallback to the max-turns or
+consecutive-error paths: three parallel `calculator` calls, two `>`
+comparisons (the model CDATA-wrapped both, which parse.py accepts even though
+only `<`/`<=` require it), a `write_file`, then a final answer correctly
+recommending the A40. As before, the model made no `web_search` calls despite
+the task asking it to research the three cards online first -- `web_search`
+and its sanitization remain unexercised on real GPU hardware, in either run.
+The saved file has its own new transcription glitch: `calculator` returned
+the L40S ratio as the correct `0.02127906976744186`, and the model wrote it to
+the file as `"0.02 1279069767"` -- a stray space inserted mid-digit-string
+when composing the file content, not a tool or parser fault (the tool result
+itself was correct). Same family of issue as the original run's slip, still
+cosmetic, still doesn't touch the recommendation. It is one more data point
+that this model's transcription of a correct number, not its arithmetic or
+tool use, is the least reliable part of the pipeline.
+
+Not done on this run: building each precision twice to isolate build-to-build
+variance, and comparing the model's own budget reasoning (it never explicitly
+checked the $10,000 figure against any price, though all three now fit).
+
+**Original run (2026-09-16), pre-hardening code, A100-SXM4-40GB** (driver
+570.148.08, CUDA 13.3 NGC image via forward compatibility). Kept for context;
+not merged with the numbers above because the code, GPU and task text all
+differ.
 
 | precision | prefill_ms | decode_ms | ms/token | stdev |
 |---|---|---|---|---|
 | bf16 | 90.24 | 920.35 | 14.380 | 0.032 |
 | fp16 | 159.06 | 883.85 | 13.810 | 0.004 |
-
-How much weight to put on this: not much.
-
-- The two bundles are separate engine builds, run one precision after the
-  other. The 4% ms/token gap is far outside run-to-run noise but is not shown
-  to be a precision effect; build-to-build variance was not measured (build
-  each precision twice and compare).
-- Each invocation is a fresh process, so `prefill_ms` on a ~40-token prompt is
-  mostly per-process start-up cost, not prefill compute. The bf16/fp16 prefill
-  difference should not be read as a property of either precision.
-- bf16 and fp16 are both 2 bytes wide, so a small decode difference is what
-  one would expect if decode is dominated by streaming weights.
-
-**Agent run** (task below, `--max-new-tokens 1024`, bf16), excerpt:
 
 ```
 engine invocations : 4
@@ -108,24 +151,17 @@ total decode time  : 15860.76 ms across 1108 tokens
 avg decode/token   : 14.315 ms
 ```
 
-Four turns: three parallel `calculator` calls, two `>` comparisons, a
-`write_file`, then a final answer recommending the A40 (0.0272 TFLOPS/$, the
-highest of the three). The saved file transcribed the L40S ratio as 0.0201
-instead of the 0.0213 it had computed; the recommendation did not depend on it.
+This run's task had an unsatisfiable budget ($5,000 against three cards priced
+at $5,500/$8,600/$6,800); the agent recommended the A40 without flagging that
+it exceeded the budget. `DEFAULT_TASK` was changed to $10,000 afterward, which
+the current run above used. This run also made no `web_search` calls, and its
+saved file had its own transcription slip (0.0201 instead of the computed
+0.0213).
 
-Caveats on this run:
-
-- **The task it ran had an unsatisfiable budget.** It said $5,000, but the
-  three cards are priced at $5,500 / $8,600 / $6,800. The agent recommended the
-  A40 without flagging that it exceeds the budget. The task now says $10,000.
-- **The throughput figures were supplied, not sourced, and were not checked
-  against datasheets.** The task called them "dense FP16 TFLOPS"; they may not
-  be the same precision or execution path across the three cards. The
-  recommendation is only as good as those inputs, so it says nothing about
-  which card is faster.
-- **It made no `web_search` calls**, so `web_search` and the result
-  sanitization have not been exercised on a GPU.
-- It is a single run. Nothing here measures how reliably the model does this.
+Across both runs: the throughput figures in the task are supplied, not
+sourced or checked against datasheets, and are labeled "dense FP16 TFLOPS" in
+the task text without confirming all three cards are being compared on the
+same execution path -- the recommendation is only as good as those inputs.
 
 ## Task
 
@@ -140,13 +176,15 @@ snippets.
 
 - **No baseline.** Nothing here compares against HF `generate`, vLLM or SGLang
   on the same GPU, so the numbers say nothing about how the runtime compares.
-- **14.3 ms/token has not been explained.** It has not been compared with the
-  memory-bandwidth floor for this model's weights on this GPU, and nothing has
-  been profiled, so it is unknown whether the time is in the engine or in
-  `trtmc`'s decode loop. `decode_ms / len(token_ids)` may also be off by one if
-  the first token comes from the prefill pass.
-- **Per-turn reload cost** is now measured (wall time is reported next to
-  prefill and decode) but has no recorded run yet.
+- **The ~13-14 ms/token decode figure (both GPUs, both runs) has not been
+  explained.** It has not been compared with the memory-bandwidth floor for
+  this model's weights on either GPU, and nothing has been profiled, so it is
+  unknown whether the time is in the engine or in `trtmc`'s decode loop.
+  `decode_ms / len(token_ids)` may also be off by one if the first token comes
+  from the prefill pass.
+- **Per-turn reload cost is measured and is the dominant cost** (see Results):
+  65% of one run's wall time was outside prefill/decode. A persistent-server
+  runtime, not available for `trtmc` today, would be the fix.
 - **Encode-side parity is unchecked.** The prompt is rendered by HF but
   tokenized by `trtmc`'s C++ BPE. Whether both produce identical ids (a
   double BOS, special-token matching, pre-tokenizer differences) has not been
@@ -164,7 +202,12 @@ snippets.
 - Sanitization is pattern-based and validated only against HF's tokenizer
   behaviour and `trtmc`'s source, not end to end on a GPU.
 - `precision_compare.py` runs all bf16 invocations before all fp16 ones rather
-  than interleaving them.
+  than interleaving them, and each precision has been built only once, so the
+  ~4% bf16/fp16 gap (reproduced on two separate GPUs now) is still not shown
+  to be a precision effect rather than build-to-build variance.
+- The model has never used the calculator to check the task's own budget
+  figure against a price; the current task's budget happens to be satisfied
+  by all three cards, so this has not yet mattered to the answer.
 
 ## Setup
 
@@ -177,17 +220,55 @@ pip install -r requirements.txt        # runtime
 pip install -r requirements-dev.txt    # plus pytest
 ```
 
-Two GPU-setup gotchas hit on rented hardware:
+TRT-MC's own documented path
+([`source-build.md`](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/source-build))
+worked as written, verified 2026-09-22 on an A100 (compute capability 8.0):
+build `Dockerfile.dev.x86`, run it with `--gpus`, then inside the container:
 
+```bash
+cmake -S . -B build-sm80 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=80-real \
+  -DTRTMC_BUILD_BACKEND_RTX=OFF -DTRTMC_BUILD_TESTS=OFF -DTRTMC_BUILD_EXAMPLES=OFF
+cmake --build build-sm80 --parallel "$(nproc)" \
+  --target trtmc trtmc_backend_trt trtmc_model_llama
+```
+
+(`-real` after the SM number, and no build for families this project doesn't
+use.) Then build both bundles:
+
+```bash
+export PYTHONPATH=core/builder:apps/benchmark:$PWD  # see gotcha below
+python -m tensorrt_model_connect build openbmb/MiniCPM5-2B \
+  --precision bf16 --max-sequence-length 4096 --output minicpm5-2b-bf16.bundle
+python -m tensorrt_model_connect build openbmb/MiniCPM5-2B \
+  --precision fp16 --max-sequence-length 4096 --output minicpm5-2b-fp16.bundle
+```
+
+Gotchas hit on rented hardware:
+
+- **`source-build.md`'s own recommended
+  `pip install --no-deps -e . -C py-only=true` is currently broken upstream**
+  (a Conan build error, regardless of that flag, as of 2026-09-22). Worked
+  around by skipping the pip install and setting `PYTHONPATH` directly to
+  `core/builder`, `apps/benchmark`, and the repo root instead -- the same
+  approach TRT-MC's own `tools/community_gpu_ci.py` uses internally. Only the
+  Python build CLI needs this; the native `trtmc`/`trtmc_backend_trt`/
+  `trtmc_model_llama` build above is unaffected.
 - `CMAKE_CUDA_ARCHITECTURES` defaults to 89 (Ada) in TRT-MC's GPU dev
-  Dockerfile and CI. On other architectures (this was validated on an A100,
-  compute capability 8.0) override it when building, e.g.
-  `-e CMAKE_CUDA_ARCHITECTURES=80` for the `tools.community_gpu_ci` path. It
-  only matters for families with `.cu` sources; `families/llama` has none.
+  Dockerfile and CI, matching the community CI's L4/L40/L40S fleet. The
+  `source-build.md` path above derives the right value automatically from
+  `nvidia-smi --query-gpu=compute_cap`; only the separate
+  `tools.community_gpu_ci` CI path needs a manual
+  `-e CMAKE_CUDA_ARCHITECTURES=80` override on non-Ada hardware. Moot for
+  `families/llama` either way, since it has no `.cu` sources.
 - NGC images set up CUDA Forward Compatibility only for the entrypoint's own
   process, so a later `docker exec` sees `torch.cuda.is_available() == False`.
   Pass `-e LD_LIBRARY_PATH=/usr/local/cuda/compat/lib` on each `docker exec`
-  that needs the GPU.
+  that needs the GPU. Not reproduced during the 2026-09-22 verification (which
+  did `docker exec` into a long-lived container repeatedly and never saw
+  `torch.cuda.is_available() == False` from this cause) -- possibly specific
+  to an older image/driver combination than the one used here; listed as a
+  known gotcha, not confirmed against this exact setup.
 
 ## Run
 
