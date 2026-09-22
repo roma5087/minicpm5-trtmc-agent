@@ -128,15 +128,40 @@ text to 851. The alignment shows two distinct problems:
 finding above) -- it is systematically **under-merging plain text** relative
 to the checkpoint's real tokenizer. This means every prompt this project has
 ever sent to `trtmc`, on every turn, differs from what MiniCPM5-2B's own
-tokenizer would have produced for the same text. The root cause has not been
-diagnosed (a pre-tokenization split-boundary mismatch is consistent with the
-pattern -- every example above is a merge across what looks like a
-regex-driven pretokenizer split point -- but this is not confirmed by reading
-the encoder's pretokenization code, only inferred from the symptom). Not
-fixed here, not filed upstream. Whether it measurably changes model behavior
-(versus being a difference TensorRT-Model-Connect's own detokenization of the
-*output* happens not to expose) is also unverified -- the agent still
-completes its task correctly despite it, in every run so far.
+tokenizer would have produced for the same text.
+
+**Root cause, confirmed with a second debug print** (also instance-local,
+also never pushed): a print of the pretokenizer's own word segments, added to
+`encode_bytelevel()`, shows `trtmc` splits `"sentence.\n\n"` into the separate
+words `"sentence"`, `"."`, `"\n"`, `"\n"` -- three pretoken boundaries where
+HF's tokenizer keeps `".\n\n"` as one. BPE merges never cross a pretoken
+boundary (`encode_bytelevel` runs `apply_merges` once per word), so once `.`
+and the following newlines are split into separate words, no merge rule can
+ever put them back together -- this is the actual mechanism behind every
+example in the table above, not just the newline ones.
+
+*Why* they're split into separate words traces to a real, narrow, one-line
+bug in `detect_split_variant()`. MiniCPM5-2B's `tokenizer.json` declares a
+`Sequence` pre-tokenizer with two `Split` regex steps, in this order:
+digit-grouping (`\p{N}{1,3}`) first, then the real word/punctuation-boundary
+regex second -- and that second regex is the exact Qwen3-style pattern
+(` ?[^\s\p{L}\p{N}]+[\r\n]*`, which `trtmc`'s own source recognizes and has a
+comment about: "keeps trailing newlines attached to punctuation/symbol runs
+even without an optional prefix"). But `detect_split_variant()` returns on
+the *first* `Split` step it finds with a regex pattern -- the digit-grouping
+one -- and never looks at the second. The digit regex matches none of
+`classify_split()`'s known patterns, so it falls through to the generic
+`kLlama` default, and the Qwen3-specific newline-attachment logic (gated on
+`variant == Qwen3`) never runs. Confirmed directly: the debug print reports
+`variant=0` (`kLlama`) for this checkpoint, when the checkpoint's actual
+second `Split` regex should classify as `kQwen3` (`variant=1`) on its own.
+
+This is a precise, one-line-fixable bug (scan every `Split` step for one
+`classify_split()` recognizes, instead of returning on the first), but it is
+not fixed here and not filed upstream -- this project only diagnosed it.
+Whether it measurably changes model behavior, versus being a difference the
+model tolerates, is also unverified: the agent still completes its task
+correctly despite it, in every run so far.
 
 ## Results
 
@@ -308,11 +333,12 @@ snippets.
 - **Per-turn reload cost is measured and is the dominant cost** (see Results):
   65% of one run's wall time was outside prefill/decode. A persistent-server
   runtime, not available for `trtmc` today, would be the fix.
-- **Encode-side parity is checked and broken** (see "The trtmc findings"
-  above): `trtmc`'s encoder produces 851 ids for a prompt HF encodes to 826,
-  including a double leading BOS and 31 places where a merge HF applies is
-  missing. Root cause not diagnosed, not fixed, not filed upstream. Whether it
-  changes model behavior, not just token count, is unverified.
+- **Encode-side parity is checked, broken, and root-caused** (see "The trtmc
+  findings" above): `trtmc`'s encoder produces 851 ids for a prompt HF encodes
+  to 826, including a double leading BOS and 31 places where a merge HF
+  applies is missing, traced to a one-line pretokenizer-variant-detection bug.
+  Not fixed here, not filed upstream. Whether it changes model behavior, not
+  just token count, is unverified.
 - **Tool results are formatted as one `user` turn per call**
   (`<tool_response>…</tool_response>`), confirmed to differ from the
   template's own `tool` role (see Further checks); a single run with the
