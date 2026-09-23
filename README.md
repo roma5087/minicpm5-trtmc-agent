@@ -475,9 +475,37 @@ snippets.
   it, vLLM ~42%, HF eager ~13%.** That says how far each is from the floor,
   not which specific mechanism (host launch overhead, no CUDA graphs, other
   per-step cost) accounts for the gap -- nothing has been profiled, and that
-  still needs GPU access this project doesn't currently have. `decode_ms /
-  len(token_ids)` may also be off by one if the first token comes from the
-  prefill pass.
+  still needs GPU access this project doesn't currently have.
+- **`decode_ms / len(token_ids)` has a real, small, two-directional bias --
+  resolved by reading `families/llama/runtime/pipeline.cpp`'s
+  `generate_from_ids()`/`run_decode_loop()` directly, not by guessing.**
+  `decode_ms` times the whole decode loop (`t1` to `t2`), which includes one
+  GPU `run_step()` forward pass *after* each sampled token to prepare the
+  *next* step's logits -- except the loop calls it unconditionally after
+  every non-stopping token, including the last one, whose output then goes
+  unused if the loop simply runs out of `max_new_tokens`. So: a run that
+  exhausts `max_new_tokens` without hitting EOS pays for one *extra, wasted*
+  `run_step()` call the returned tokens don't need, so `decode_ms/N`
+  overcounts the true per-step cost by about `1/N`. A run that stops via EOS
+  or a stop condition breaks *before* that final `run_step()`, so it never
+  runs, and `decode_ms/N` undercounts by about `1/N` instead (`token_0`'s own
+  identity comes free from `run_prefill()`'s logits, correctly billed to
+  `prefill_ms`, not `decode_ms`, in both cases). Applied to this project's
+  own numbers: `precision_compare.py`'s runs generated exactly 64 tokens
+  (`max_new_tokens`) every single time across all 30 runs made this session
+  (3 separate invocations x 5 bf16 + 5 fp16 each) -- consistent with
+  hitting the cap, not stopping early via EOS on an open-ended "explain X"
+  continuation -- so its ms/token figures are very likely ~1.6% (1/64)
+  *higher* than the true steady-state per-step cost. The real agent runs'
+  per-turn generation (~298 tokens/turn average -- 1191 total across 4
+  turns, each turn capped independently at 1024) almost certainly stopped
+  via `<|im_end|>` well before reaching that per-turn cap, so those numbers
+  are more likely slightly *undercounting* instead, by roughly `1/298`
+  (~0.3%), smaller than the ~1.6% (`1/64`) overcount on the
+  `precision_compare.py` side. Either way the effect is a fraction of a
+  percent to ~1.6%, well inside the run-to-run variance already reported
+  (stdev up to 0.113 ms/token) -- real, now precisely explained, not something that
+  changes any conclusion in this README.
 - **Per-turn reload cost is measured and is the dominant cost** (see Results):
   65% of one run's wall time was outside prefill/decode. A persistent-server
   runtime, not available for `trtmc` today, would be the fix.
