@@ -497,8 +497,14 @@ snippets.
   template's own `tool` role (see Further checks); a single run with the
   native format also worked, but one run each does not show which is more
   reliable.
-- Sampling parameters are not passed to `trtmc`; whether it decodes greedily
-  by default is not documented here.
+- **Sampling parameters are not passed to `trtmc`, and it decodes greedily by
+  default.** Confirmed by reading `apps/cli/cli.cpp`'s `dispatch_run()`:
+  `config.top_k = int_option(command, "--top-k", 1, 0)` -- default value `1`
+  when `--top-k` isn't passed, and `top_k=1` means only the single
+  highest-probability token is ever a candidate, which is greedy decoding
+  regardless of `temperature`/`top_p` (both also default to non-restrictive
+  values, `1.0`, that this makes moot). Every run in this README was greedy;
+  none of it depends on an unknown sampling mode.
 - Tool-call parsing is matched to MiniCPM5's template, not general.
 - One GPU, one request at a time, no batching.
 - `web_search` depends on `ddgs`; result quality is outside this project.

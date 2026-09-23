@@ -2,11 +2,14 @@
 own chat template, instead of relying on trtmc's C++ chat-template detection
 (`--use-chat-template true`). That detection logic substring-sniffs the Jinja
 template to classify it into a handful of known formats (Llama/Phi/etc.) --
-see the TensorRT-Model-Connect issue filed against families/llama/runtime/
-chat_templates.cpp for a case where that misclassifies a real template. Tool
-calling depends on exact template fidelity (tool schemas, <tool_response>
-wrapping, etc.), so we render with the real HF tokenizer/template instead and
-feed trtmc the finished text directly.
+see NVIDIA/TensorRT-Model-Connect#1284 (merged 2026-09-13, fixing #1271):
+`chat_templates.cpp` classified TinyLlama/Zephyr templates as Phi because
+both share `<|user|>`/`<|assistant|>` role tags, then injected Phi's
+`<|end|>` turn-end token instead of the model's real `</s>`, causing the
+model's first decode step to predict EOS immediately. Tool calling depends
+on exact template fidelity (tool schemas, <tool_response> wrapping, etc.),
+so we render with the real HF tokenizer/template instead and feed trtmc the
+finished text directly.
 """
 
 from __future__ import annotations
