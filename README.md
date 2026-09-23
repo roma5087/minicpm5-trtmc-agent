@@ -161,25 +161,71 @@ one -- and never looks at the second. The digit regex matches none of
 `variant=0` (`kLlama`) for this checkpoint, when the checkpoint's actual
 second `Split` regex should classify as `kQwen3` (`variant=1`) on its own.
 
-This is a precise, one-line-fixable bug on `trtmc`'s side (scan every `Split`
-step for one `classify_split()` recognizes, instead of returning on the
-first), but it cannot be fixed from this project: `trtmc run` does not expose
-a way to hand it already-tokenized ids instead of raw text for this bundle
-type. `--token-ids` exists as a CLI option and is checked directly (also
-2026-09-22): it is explicitly rejected --
+This bug cannot be fixed from this project's own code: `trtmc run` has no way
+to accept already-tokenized ids instead of raw text for this bundle type.
+`--token-ids` exists as a CLI option and was checked directly (2026-09-22):
+it is explicitly rejected --
 `Error: --token-ids requires an explicit Task SDK contract, not the existing
 interface` -- for the "existing bundle mode" `families/llama` uses (the one
 that needs `--runtime-root`, confirmed by reading `apps/cli/cli.cpp`'s
-`dispatch()`/`dispatch_run()`). So the only real fix is the one-line change
-inside `bpe_tokenizer.cpp` itself, and it is not made or filed upstream here
--- this project diagnosed it, and fixed the one piece (the BOS) that its own
-code could reach. Whether the remaining under-merging measurably changes
-model behavior, versus being a difference the model tolerates, is also
-unverified: the agent still completes its task correctly despite it, in
-every run so far, including the run after the BOS fix -- re-run with the
-fixed `render.py` (same task, same `--max-new-tokens 1024`, bf16), still 4
-turns, still no crash or malformed call, still the correct A40
-recommendation.
+`dispatch()`/`dispatch_run()`). So the only real fix is inside
+`bpe_tokenizer.cpp` itself. This project doesn't ship or distribute that file
+-- any patch stays instance-local, the same as the debug prints above -- and
+nothing here has been filed upstream.
+
+**A patch was written and tested anyway, to find out whether "scan every
+`Split` step" is actually as simple as it sounds. It wasn't, on the first
+try.** (2026-09-23, a fresh GPU instance, same checkpoint, same task; all of
+this section is instance-local, unpushed, and not filed upstream.)
+
+*v1: scan every `Split` step, take variant and digit-group size together
+from whichever step first classifies as something other than `kLlama`.* This
+matched the "one-line fix" description above, literally. Rebuilt, re-ran the
+real 825-token prompt (post-BOS-fix baseline): `trtmc` now correctly detects
+`kQwen3` and the newline-merge problem is gone -- but the total count went
+from 850 to **871**, worse than before the patch. Every new mismatch was a
+multi-digit number splitting into individual digits (e.g. a single HF token
+for a 4-digit number becoming 3 separate `trtmc` tokens). v1 fixed one
+problem and introduced a bigger one.
+
+*Root cause of the v1 regression:* `classify_split()`'s Qwen3-detection path
+also tries to read a digit-grouping size out of the *same* regex
+(`parse_digit_group()`, looking for a literal `\p{N}{`). But this
+checkpoint's digit-grouping value (group up to 3 digits, from `\p{N}{1,3}`)
+lives in the *first*, separate `Split` step -- the one that determines the
+variant is the *second* step, whose own digit alternative is a plain
+`\p{N}+` with no `{N}` syntax to parse. v1 took the digit-group value from
+the wrong step, silently got 0, and (per `try_simple_run()`) `variant ==
+kQwen3` with `digit_group <= 1` means the digit-scanning call is skipped
+entirely -- every digit becomes its own one-character pretoken, which BPE
+can never re-merge across pretoken boundaries.
+
+*v2: find the variant and the digit-group size independently*, each by
+scanning every `Split` step on its own terms -- the first step that
+classifies as non-`kLlama` decides the variant; separately, the first step
+in which `parse_digit_group()` finds anything at all decides the digit-group
+size, whether or not that step is the one that decided the variant. Rebuilt,
+re-ran the same prompt: **825 ids for `trtmc`, 826 for HF (with its own
+auto-BOS, for a fair comparison) -- one remaining token**, down from the
+original 25. The one that's left: HF has an extra trailing `220` (a newline)
+right after the special `assistant` role token at the very end of the
+prompt, where `add_generation_prompt=True`'s `<|im_start|>assistant\n` ends
+the text -- a minor trailing-whitespace-at-end-of-string edge case, not
+further diagnosed.
+
+Re-ran the full default task with the v2-patched build: still 4 turns, no
+crash, no malformed call, correct A40 recommendation -- and, on this one run,
+every number in the saved file was transcribed cleanly, no stray-space
+glitch. One run isn't evidence that the fix caused that; it's one data point
+worth having.
+
+Both patches are precise and small, but v1's failure is the actual lesson:
+a "one-line fix" description that sounds obviously correct can still be
+wrong in a way that only shows up by actually building and testing it, not
+by reading the surrounding code. Neither patch is shipped in this project,
+filed upstream, or proposed as a PR -- this is a diagnostic record of what
+was tried and what it took to get a correct result, kept instance-local like
+everything else in this section.
 
 ## Results
 
@@ -274,12 +320,14 @@ sourced or checked against datasheets, and are labeled "dense FP16 TFLOPS" in
 the task text without confirming all three cards are being compared on the
 same execution path -- the recommendation is only as good as those inputs.
 
-## Further checks (2026-09-22)
+## Further checks (2026-09-22 and 2026-09-23)
 
-Three more checks were run on the same A100-SXM4-80GB, following up on items
-the Results and Limitations sections above had left open. (The fourth
-follow-up, encode-side parity, produced the encoder finding above and is
-documented there, not here.)
+Several more checks were run following up on items the Results and
+Limitations sections above had left open: three on 2026-09-22 (same
+A100-SXM4-80GB as the current run above), the vLLM baseline on 2026-09-23 (a
+different A100-SXM4-80GB instance -- same GPU spec, fresh hardware, since the
+first instance had been torn down by then). Encode-side parity produced the
+encoder finding above and is documented there, not here.
 
 **Build-to-build variance, to check whether the ~4% bf16/fp16 gap is a real
 precision effect.** Each precision was built a second time from the same
@@ -295,23 +343,37 @@ on both GPUs in the Results above. That is evidence the precision gap is a
 real effect, not two engine builds that happen to differ -- though it is
 still only two builds per precision, not a distribution.
 
-**An HF baseline** (not vLLM/SGLang -- scoped down to a plain
-`transformers.generate()` call for cost and time; the vLLM/SGLang comparison
-is still not done): bf16, greedy, the same prompt and GPU as
-`precision_compare.py`, prefill timed separately from decode the same way
-`trtmc` reports the two:
+**Two baselines** (bf16, greedy, the same prompt and GPU as
+`precision_compare.py`):
 
-| | ms/token (decode-only) |
+| | ms/token |
 |---|---|
-| HF `generate()`, eager, bf16, greedy | 19.150 |
+| HF `generate()`, eager, bf16, greedy (decode-only, prefill subtracted) | 19.150 |
 | `trtmc`, this session's runs | 13.147 - 13.879 |
+| vLLM 0.30.0, CUDA graphs + `torch.compile`, persistent server (2026-09-23) | 5.899 (stdev 0.008, n=5) |
 
-`trtmc` is meaningfully faster than naive HF eager mode (roughly 1.4x), which
-is a real result this project didn't have before. It does not answer whether
-13-14 ms/token is *good* -- that needs the memory-bandwidth-floor estimate and
-profiling the Limitations section below still asks for, and neither HF eager
-nor `trtmc` here uses CUDA graphs or a KV-cache-optimized serving stack, so
-neither number is a ceiling on what's achievable.
+vLLM's number is (prefill+decode)/tokens, not decode-only like the other two
+-- but the prompt here is 19 tokens, so prefill is a small fraction of the
+total either way. The bigger difference is architectural, not just kernels:
+vLLM runs as a persistent server with the model loaded once, so none of the
+per-turn engine-reload cost that dominates `trtmc`'s real agent runs (see
+Results) exists here at all. `trtmc` is faster than naive HF eager mode
+(~1.4x); vLLM is faster than `trtmc` (~2.3x) and HF eager (~3.2x). None of
+this says 13-14 ms/token is bad on its own terms -- that still needs the
+memory-bandwidth-floor estimate the Limitations section asks for -- but it
+does mean a real, commonly-used serving stack beats `trtmc`'s numbers on this
+GPU, for this model, today. SGLang was not attempted (time/cost).
+
+Getting vLLM running on this bare host (no system CUDA toolkit, no `g++`
+JIT-compile chain preconfigured) took working through: `flashinfer`'s JIT
+sampler kernel needs `nvcc` (the pip `nvidia-cuda-nvcc-cu13` wheel provides
+one, at `.../site-packages/nvidia/cu13/bin`, not the path `flashinfer`
+assumes) and `ninja` (pip-installed but not on `PATH` when invoking the venv
+interpreter by absolute path rather than activating it) and a working
+`cc1plus` (i.e. `g++`, already present here but the JIT step still failed
+against it) -- rather than debug the C++ toolchain further, the run above
+sets `VLLM_USE_FLASHINFER_SAMPLER=0`, which skips that kernel and its JIT
+compile entirely and uses vLLM's own sampler instead.
 
 **The native `tool`-role format, read directly from
 `chat_template.jinja`:** `role: "tool"` messages merge consecutive results
@@ -338,10 +400,12 @@ snippets.
 
 ## Limitations and open questions
 
-- **A plain HF eager baseline exists (see Further checks); vLLM/SGLang do
-  not.** `trtmc` is ~1.4x faster than naive HF `generate()`, but nothing here
-  compares against a real serving stack, so the numbers still say little about
-  how competitive the runtime actually is.
+- **HF eager and vLLM baselines both exist now (see Further checks); SGLang
+  does not.** `trtmc` is ~1.4x faster than naive HF `generate()` but ~2.3x
+  slower than vLLM with CUDA graphs and `torch.compile` -- a real,
+  commonly-used serving stack beats `trtmc`'s numbers here, though vLLM's
+  number also has no per-turn reload cost (persistent server) while
+  `trtmc`'s real numbers, as used by this agent, do.
 - **The ~13-14 ms/token decode figure (both GPUs, both runs) has not been
   explained.** It has not been compared with the memory-bandwidth floor for
   this model's weights on either GPU, and nothing has been profiled, so it is
@@ -351,15 +415,17 @@ snippets.
 - **Per-turn reload cost is measured and is the dominant cost** (see Results):
   65% of one run's wall time was outside prefill/decode. A persistent-server
   runtime, not available for `trtmc` today, would be the fix.
-- **Encode-side parity is checked, broken, root-caused, and partly fixed**
-  (see "The trtmc findings" above): `trtmc`'s encoder produced 851 ids for a
-  prompt HF encodes to 826, traced to a one-line pretokenizer-variant-
-  detection bug. The double leading BOS (one of the 25 extra ids) is fixed in
-  `render.py`, verified directly (851 -> 850). The other ~24 (BPE
-  under-merging) cannot be fixed from this project -- `trtmc run` has no way
-  to accept pre-tokenized ids for this bundle type (`--token-ids` is checked
-  and explicitly rejected) -- and are not fixed here or filed upstream.
-  Whether they change model behavior, not just token count, is unverified.
+- **Encode-side parity is checked, broken, root-caused, and reduced to one
+  residual token out of 826** (see "The trtmc findings" above): `trtmc`'s
+  encoder originally produced 851 ids for a prompt HF encodes to 826. The
+  double leading BOS is fixed in `render.py`, shipped in this project
+  (851 -> 850, verified). A `bpe_tokenizer.cpp` patch closing the rest of the
+  gap was written and tested on 2026-09-23 -- a first attempt made things
+  worse (871) before a corrected version got to 825 vs HF's 826 -- but that
+  patch cannot be fixed from this project: it's instance-local only, not
+  filed upstream, and not something this project ships or distributes.
+  Whether the remaining gap changes model behavior, not just token count, is
+  unverified.
 - **Tool results are formatted as one `user` turn per call**
   (`<tool_response>…</tool_response>`), confirmed to differ from the
   template's own `tool` role (see Further checks); a single run with the
