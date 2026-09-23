@@ -110,9 +110,11 @@ text to 851. The alignment shows two distinct problems:
    for the same prompt dropped from 851 to 850, and the sequence now starts
    with a single `0`, matching HF. This is the one part of the encode finding
    fixable from this project's own code; the rest is not (see below).
-2. **31 places where HF merges two characters into one vocab token and
+2. **Multiple places where HF merges two characters into one vocab token and
    `trtmc` does not**, scattered through the whole prompt, not clustered
-   anywhere in particular. Representative examples (decoded):
+   anywhere in particular -- 24 extra tokens overall (850 vs HF's 826) once
+   the BOS fix above is accounted for. Representative examples, each decoded
+   and confirmed directly against the real output at the time:
 
    | text | HF (1 token) | trtmc (2 tokens) |
    |---|---|---|
@@ -123,11 +125,19 @@ text to 851. The alignment shows two distinct problems:
    | `-name` | `35768` | `34` (`-`) + `2075` (`name`) |
    | `}}}` + newline | `113927` | `16570` (`}}}`) + `220` |
 
-   Two of the 31 mismatches are a different shape: HF and `trtmc` both use two
+   A few mismatches were a different shape: HF and `trtmc` both use two
    tokens for the same text (e.g. `-wrapped`, `6000`), just split at a
-   different point (`3248`+`39996` vs `34`+`112403` for `-wrapped`). Not a
+   different point (`3248`+`39996` vs `34`+`112403` for `-wrapped`) -- not a
    clean merge loss like the six above, but still a real divergence in what
-   ids the model actually receives.
+   ids the model actually receives. (An earlier version of this section put a
+   precise count -- "31 places," "29 clean, 2 different-shape" -- on this
+   breakdown; a later review found that count didn't arithmetically reconcile
+   with the 24-token total, and the original alignment data needed to
+   re-derive an exact, correct count no longer exists, since it was captured
+   on a GPU instance that has since been torn down. The aggregate gap (24)
+   and the specific examples above were independently re-verified and are
+   solid; the precise per-category count was not, so it's been removed rather
+   than left wrong.)
 
 `trtmc`'s BPE encoder is not just mishandling special tokens (the decode
 finding above) -- it is systematically **under-merging plain text** relative
@@ -184,9 +194,12 @@ matched the "one-line fix" description above, literally. Rebuilt, re-ran the
 real 825-token prompt (post-BOS-fix baseline): `trtmc` now correctly detects
 `kQwen3` and the newline-merge problem is gone -- but the total count went
 from 850 to **871**, worse than before the patch. Every new mismatch was a
-multi-digit number splitting into individual digits (e.g. a single HF token
-for a 4-digit number becoming 3 separate `trtmc` tokens). v1 fixed one
-problem and introduced a bigger one.
+multi-digit number splitting into individual digits, one token per digit
+(e.g. HF's single token for `"150"` becoming `trtmc`'s three tokens
+`["1","5","0"]`) -- consistent with the mechanism in the root-cause
+paragraph below (every digit becomes its own pretoken), not the "N digits
+into N-1 tokens" an earlier draft of this section mistakenly illustrated
+with. v1 fixed one problem and introduced a bigger one.
 
 *Root cause of the v1 regression:* `classify_split()`'s Qwen3-detection path
 also tries to read a digit-grouping size out of the *same* regex
