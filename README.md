@@ -45,7 +45,12 @@ Behaviours of the loop worth knowing:
   the token list is read from the tokenizer and each match is broken with a
   zero-width space; NUL bytes and lone surrogates are removed.
 - **The prompt is length-checked** against `--max-sequence-length` (default
-  4096, must equal the bundle's build setting) before `trtmc` is invoked.
+  4096, must equal the bundle's build setting) before `trtmc` is invoked --
+  but the count comes from HF's tokenizer, not `trtmc`'s. Per "The trtmc
+  findings" below, `trtmc`'s own encoder produces more ids than HF's count
+  for the same text (an unclosed gap of about 24-25 tokens as of this
+  writing), so a prompt sized right at the boundary can pass this check and
+  still overrun what `trtmc` actually processes.
 - Tool errors are fed back so the model can retry; three consecutive error
   turns stop the run.
 - An optional one-shot example of a full tool-call round trip is on by default
@@ -372,10 +377,10 @@ vLLM runs as a persistent server with the model loaded once, so none of the
 per-turn engine-reload cost that dominates `trtmc`'s real agent runs (see
 Results) exists here at all. `trtmc` is faster than naive HF eager mode
 (~1.4x); vLLM is faster than `trtmc` (~2.3x) and HF eager (~3.2x). None of
-this says 13-14 ms/token is bad on its own terms -- that still needs the
-memory-bandwidth-floor estimate the Limitations section asks for -- but it
-does mean a real, commonly-used serving stack beats `trtmc`'s numbers on this
-GPU, for this model, today. SGLang was not attempted (time/cost).
+this says 13-14 ms/token is bad on its own terms -- that comparison is below,
+against a memory-bandwidth floor -- but it does mean a real, commonly-used
+serving stack beats `trtmc`'s numbers on this GPU, for this model, today.
+SGLang was not attempted (time/cost).
 
 Getting vLLM running on this bare host (no system CUDA toolkit, no `g++`
 JIT-compile chain preconfigured) took working through: `flashinfer`'s JIT
@@ -387,6 +392,52 @@ interpreter by absolute path rather than activating it) and a working
 against it) -- rather than debug the C++ toolchain further, the run above
 sets `VLLM_USE_FLASHINFER_SAMPLER=0`, which skips that kernel and its JIT
 compile entirely and uses vLLM's own sampler instead.
+
+**Memory-bandwidth floor for the three numbers above** -- pure arithmetic on
+values already measured in this README, no new GPU access needed (done after
+the instance in the rest of this section was terminated):
+
+`trtmc`'s own engine-build log for the bf16 bundle reports `Total Weights
+Memory: 5,035,171,328 bytes`; vLLM's independent checkpoint loader reports
+the same number a different way (`Checkpoint size: 4.69 GiB`, and
+5,035,171,328 / 1024^3 = 4.6894 GiB -- exact match, two different code paths
+agreeing). Autoregressive decode of a dense model at batch size 1 is
+memory-bandwidth-bound, not compute-bound: computing one token needs every
+weight streamed from HBM exactly once, so `weights_bytes / HBM_bandwidth` is
+a hard floor on decode time per token, before counting anything else (KV
+cache reads, launch overhead, sampling). A100-SXM4-80GB's HBM2e bandwidth is
+2039 GB/s per NVIDIA's public datasheet (not independently verified this
+session -- a well-known spec, not a live measurement). That gives:
+
+```
+weights: 5,035,171,328 bytes / 2,039,000,000,000 B/s = 2.469 ms
+KV cache (42 layers x 2 (K,V) x 256 (2 heads x 128 head_dim) x 2 bytes,
+          bf16, MiniCPM5-2B's GQA): 43,008 bytes/token of context
+  at ~900 tokens (this project's actual turn sizes): +0.019 ms
+  at the full 4096-token build limit:                +0.086 ms
+floor ~= 2.49-2.56 ms/token -- weights dominate; KV cache is a rounding error
+         at this model's context lengths, because it only has 2 KV heads
+```
+
+| | ms/token | x floor | memory-bandwidth utilization |
+|---|---|---|---|
+| `trtmc` (this session's range) | 13.147 - 13.879 | 5.3-5.6x | ~18-19% |
+| vLLM | 5.899 | 2.4x | ~42% |
+| HF eager | 19.150 | 7.7x | ~13% |
+
+None of these are anywhere near the floor, which is normal -- 100% memory
+bandwidth utilization isn't achievable in practice, and a well-tuned serving
+stack typically lands somewhere in the 40-70% range, which is roughly where
+vLLM's ~42% sits. `trtmc` at ~18-19% and HF eager at ~13% both have real,
+identifiable room between them and vLLM, consistent with `trtmc` having no
+CUDA graphs and paying full per-turn process/engine-reload cost (see
+Results) and HF eager having neither CUDA graphs nor a fused decode loop.
+This derivation says *how far* each number is from the floor and is
+consistent with what's already known about each stack's optimizations
+(or lack of them); it does not by itself prove *which specific mechanism* --
+host launch overhead, no CUDA graphs, Python-level per-step overhead --
+accounts for each gap. That still needs profiling (`nsys`/Nsight), which
+needs GPU access this project doesn't currently have.
 
 **The native `tool`-role format, read directly from
 `chat_template.jinja`:** `role: "tool"` messages merge consecutive results
@@ -419,12 +470,14 @@ snippets.
   commonly-used serving stack beats `trtmc`'s numbers here, though vLLM's
   number also has no per-turn reload cost (persistent server) while
   `trtmc`'s real numbers, as used by this agent, do.
-- **The ~13-14 ms/token decode figure (both GPUs, both runs) has not been
-  explained.** It has not been compared with the memory-bandwidth floor for
-  this model's weights on either GPU, and nothing has been profiled, so it is
-  unknown whether the time is in the engine or in `trtmc`'s decode loop.
-  `decode_ms / len(token_ids)` may also be off by one if the first token comes
-  from the prefill pass.
+- **The ~13-14 ms/token decode figure is now compared against a
+  memory-bandwidth floor (see Further checks): `trtmc` runs at ~18-19% of
+  it, vLLM ~42%, HF eager ~13%.** That says how far each is from the floor,
+  not which specific mechanism (host launch overhead, no CUDA graphs, other
+  per-step cost) accounts for the gap -- nothing has been profiled, and that
+  still needs GPU access this project doesn't currently have. `decode_ms /
+  len(token_ids)` may also be off by one if the first token comes from the
+  prefill pass.
 - **Per-turn reload cost is measured and is the dominant cost** (see Results):
   65% of one run's wall time was outside prefill/decode. A persistent-server
   runtime, not available for `trtmc` today, would be the fix.

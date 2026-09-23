@@ -206,6 +206,16 @@ _UNSAFE_MARKER_SUBSTRINGS = (
     "</param>",
     "<![CDATA[",
     "]]>",
+    # parse.py's strip_thinking() treats <think>/</think> as structural (see
+    # its own docstring): an injected one could hide a forged tool call from
+    # history, or (unclosed) make a later turn's real answer get dropped.
+    # These are also in MiniCPM5-2B's own added-vocab, so sanitize_tool_result()
+    # normally neutralizes them via the tokenizer-derived `added_tokens` list
+    # already -- kept here too so that coverage doesn't silently depend on
+    # the right tokenizer being loaded; a mismatched --model-dir must not be
+    # able to quietly drop this protection.
+    "<think>",
+    "</think>",
 )
 
 
