@@ -245,6 +245,34 @@ filed upstream, or proposed as a PR -- this is a diagnostic record of what
 was tried and what it took to get a correct result, kept instance-local like
 everything else in this section.
 
+**Does the encode gap actually change model behavior, not just token
+count? Checked directly on 2026-09-24, on a fresh instance -- yes.** `trtmc`
+decodes greedily and deterministically (see Limitations: `top_k` defaults to
+1), and this was confirmed empirically first: 5 repeated runs of the
+unpatched build were byte-identical to each other except for timing (same
+token counts, same text, throughout); 2 repeated runs of the v2-patched
+build were identical to each other the same way. That makes a single
+unpatched-vs-patched comparison a clean, repeatable signal, not run-to-run
+noise. The two runs:
+
+| | unpatched | v2-patched |
+|---|---|---|
+| total tokens generated (4 turns) | 1294 | 614 |
+| turn 1 `<think>` block | ~30 lines of repeated, circular reasoning ("Wait, ... Wait, ... Wait, ...") before acting | none visible at comparable length -- reasoning is short |
+| turn 2 comparisons | 2, using **rounded** values with `<` (`0.02721818 < 0.02`) | all 3 pairs, using the calculator's **full-precision** values with `>` |
+| saved file | plain text, 2 comparisons shown | Markdown with headers, all 3 pairwise comparisons shown |
+| final recommendation | NVIDIA A40 (correct) | NVIDIA A40 (correct) |
+
+Both runs reach the same correct answer, so a "did it get the right answer"
+check alone would have missed this entirely. What actually changed is *how*
+the model gets there: roughly half the tokens, no circular re-reasoning, and
+a more complete, more directly-verified comparison (all three pairs via the
+calculator's own precision, not two rounded eyeball-adjacent ones). This is
+real, repeatable evidence that the encode-side token mismatch does affect
+model behavior, not only the id sequence -- though it's one task, one
+checkpoint, and a sample of one clean pair, not a broad claim about the size
+or direction of the effect in general.
+
 ## Results
 
 Two runs exist, on different GPUs, and are reported separately rather than
@@ -338,49 +366,85 @@ sourced or checked against datasheets, and are labeled "dense FP16 TFLOPS" in
 the task text without confirming all three cards are being compared on the
 same execution path -- the recommendation is only as good as those inputs.
 
-## Further checks (2026-09-22 and 2026-09-23)
+## Further checks (2026-09-22 through 2026-09-24)
 
 Several more checks were run following up on items the Results and
 Limitations sections above had left open: three on 2026-09-22 (same
-A100-SXM4-80GB as the current run above), the vLLM baseline on 2026-09-23 (a
-different A100-SXM4-80GB instance -- same GPU spec, fresh hardware, since the
-first instance had been torn down by then). Encode-side parity produced the
-encoder finding above and is documented there, not here.
+A100-SXM4-80GB as the current run above); the vLLM baseline on 2026-09-23 (a
+different A100-SXM4-80GB instance, since the first had been torn down);
+build-to-build distribution, the SGLang baseline, `nsys` profiling, tool-role
+reliability, and encode-side model-behavior all on 2026-09-24 (a third
+A100-SXM4-80GB instance, same reason). Encode-side parity itself (the token
+mismatch, its root cause, and the v1/v2 fix) produced the encoder finding
+above and is documented there, not here.
 
 **Build-to-build variance, to check whether the ~4% bf16/fp16 gap is a real
-precision effect.** Each precision was built a second time from the same
-checkpoint and compared against its own first build:
+precision effect.** First checked with 2 builds per precision (below), then
+with a real distribution: 5 independently-built bf16 bundles and 5
+independently-built fp16 bundles (2026-09-24, a different A100-SXM4-80GB
+instance), each measured with `precision_compare.py`'s own methodology
+(1 warmup + 3 repeats):
+
+| | n | mean ms/token | stdev | CV |
+|---|---|---|---|---|
+| bf16 (5 builds) | 5 | 13.966 | 0.091 | 0.65% |
+| fp16 (5 builds) | 5 | 13.336 | 0.143 | 1.08% |
+
+Mean difference: 0.630 ms/token, about **5.2 pooled within-precision
+standard deviations apart** -- a much stronger signal than the original
+2-build check could give, and clear evidence the ~4-5% bf16/fp16 gap is a
+real effect, not build noise.
+
+The original, smaller check (2 builds per precision, 2026-09-22 and
+2026-09-23) is kept for context:
 
 | comparison | ms/token (v1) | ms/token (v2) | ratio |
 |---|---|---|---|
 | bf16 vs bf16 | 13.718 | 13.879 | 1.01x |
 | fp16 vs fp16 | 13.245 | 13.147 | 1.01x |
 
-Same-precision build variance is ~1%, well under the ~4% bf16/fp16 gap seen
-on both GPUs in the Results above. That is evidence the precision gap is a
-real effect, not two engine builds that happen to differ -- though it is
-still only two builds per precision, not a distribution.
-
-**Two baselines** (bf16, greedy, the same prompt and GPU as
-`precision_compare.py`):
+**Three baselines** (bf16, greedy, the same prompt and GPU as
+`precision_compare.py`; SGLang added 2026-09-24, a different A100-SXM4-80GB
+instance from the vLLM run):
 
 | | ms/token |
 |---|---|
 | HF `generate()`, eager, bf16, greedy (decode-only, prefill subtracted) | 19.150 |
 | `trtmc`, this session's runs | 13.147 - 13.879 |
-| vLLM 0.30.0, CUDA graphs + `torch.compile`, persistent server (2026-09-23) | 5.899 (stdev 0.008, n=5) |
+| vLLM 0.30.0, CUDA graphs + `torch.compile`, persistent server | 5.899 (stdev 0.008, n=5) |
+| SGLang 0.5.20, CUDA graphs, `triton` attention backend, persistent server | 4.992 (stdev 0.006, n=5) |
 
-vLLM's number is (prefill+decode)/tokens, not decode-only like the other two
--- but the prompt here is 19 tokens, so prefill is a small fraction of the
-total either way. The bigger difference is architectural, not just kernels:
-vLLM runs as a persistent server with the model loaded once, so none of the
-per-turn engine-reload cost that dominates `trtmc`'s real agent runs (see
-Results) exists here at all. `trtmc` is faster than naive HF eager mode
-(~1.4x); vLLM is faster than `trtmc` (~2.3x) and HF eager (~3.2x). None of
-this says 13-14 ms/token is bad on its own terms -- that comparison is below,
-against a memory-bandwidth floor -- but it does mean a real, commonly-used
-serving stack beats `trtmc`'s numbers on this GPU, for this model, today.
-SGLang was not attempted (time/cost).
+vLLM's and SGLang's numbers are (prefill+decode)/tokens, not decode-only like
+the other two -- but the prompt here is 19 tokens, so prefill is a small
+fraction of the total either way. The bigger difference is architectural, not
+just kernels: both run as a persistent server with the model loaded once, so
+none of the per-turn engine-reload cost that dominates `trtmc`'s real agent
+runs (see Results) exists here at all. `trtmc` is faster than naive HF eager
+mode (~1.4x); vLLM is faster than `trtmc` (~2.3x) and HF eager (~3.2x);
+SGLang is faster still -- ~1.18x faster than vLLM, ~2.7x faster than `trtmc`.
+None of this says 13-14 ms/token is bad on its own terms -- that comparison
+is below, against a memory-bandwidth floor -- but it does mean two real,
+commonly-used serving stacks both beat `trtmc`'s numbers on this GPU, for
+this model, today.
+
+Getting SGLang running took more environment work than vLLM, in sequence:
+its `deep_ep` dependency (a MoE expert-parallel dispatcher, irrelevant to
+this dense model, but imported unconditionally at module load regardless of
+which attention backend is actually requested) needs `CUDA_HOME` set with no
+fallback; its own `flashinfer`-based attention kernels needed a real `g++`
+matching the default `gcc` version (`/usr/bin/g++` resolved to gcc-12, but
+only `g++-11`'s package, and thus its `cc1plus`, was installed -- fixed with
+`apt-get install g++-12`); past that, `flashinfer`'s bundled CCCL headers
+raised `"CUDA compiler and CUDA toolkit headers are incompatible"` against
+the pip-installed `nvcc`, which was sidestepped rather than chased further by
+switching to SGLang's `attention_backend="triton"` (Triton JIT-compiles via
+its own LLVM/PTX pipeline, not `nvcc`); and finally SGLang's own separately
+JIT-compiled fused-RoPE kernel failed to *link* (`cannot find -lcudart`)
+because the pip CUDA package puts its libraries in `lib/`, versioned
+(`libcudart.so.13`), not the `lib64/libcudart.so` the linker expects --
+fixed with two symlinks (`lib64 -> lib`, `libcudart.so -> libcudart.so.13`).
+Every one of these was a real, reproducible environment gap on a bare host,
+not a code problem in this project or in SGLang.
 
 Getting vLLM running on this bare host (no system CUDA toolkit, no `g++`
 JIT-compile chain preconfigured) took working through: `flashinfer`'s JIT
@@ -427,17 +491,60 @@ floor ~= 2.49-2.56 ms/token -- weights dominate; KV cache is a rounding error
 
 None of these are anywhere near the floor, which is normal -- 100% memory
 bandwidth utilization isn't achievable in practice, and a well-tuned serving
-stack typically lands somewhere in the 40-70% range, which is roughly where
-vLLM's ~42% sits. `trtmc` at ~18-19% and HF eager at ~13% both have real,
-identifiable room between them and vLLM, consistent with `trtmc` having no
-CUDA graphs and paying full per-turn process/engine-reload cost (see
-Results) and HF eager having neither CUDA graphs nor a fused decode loop.
-This derivation says *how far* each number is from the floor and is
-consistent with what's already known about each stack's optimizations
-(or lack of them); it does not by itself prove *which specific mechanism* --
-host launch overhead, no CUDA graphs, Python-level per-step overhead --
-accounts for each gap. That still needs profiling (`nsys`/Nsight), which
-needs GPU access this project doesn't currently have.
+stack typically lands somewhere in the 40-70% range; vLLM's ~42% and
+SGLang's ~49.5% (4.992 ms/token / 2.469 ms floor = 2.0x, ~50% utilization)
+both sit there. `trtmc` at ~18-19% and HF eager at ~13% both have real,
+identifiable room between them and the two serving stacks, consistent with
+`trtmc` having no CUDA graphs and paying full per-turn process/engine-reload
+cost (see Results) and HF eager having neither CUDA graphs nor a fused
+decode loop.
+
+**Which specific mechanism accounts for `trtmc`'s gap -- profiled directly
+with `nsys` on 2026-09-24, before this session's GPU access ended.** A single
+`trtmc run` (`--max-new-tokens 64`, same benchmark prompt) was captured with
+`nsys profile --trace=cuda,nvtx,osrt`, then analyzed with `nsys stats`
+(`cuda_gpu_kern_sum`, `cuda_gpu_trace` reports) rather than the GUI. Two
+findings, from the same profile:
+
+1. **`trtmc` uploads the entire model to GPU memory *twice* on every single
+   invocation.** The trace's two largest events are both `[CUDA memcpy
+   Host-to-Device]`, at 768.243 ms and 454.038 ms, transferring 5035.171 MB
+   and 5036.220 MB respectively -- both essentially the full bf16 weight size
+   (5,035,171,328 bytes, the same figure the bandwidth-floor calculation
+   above uses). `pipeline.h` declares two separate `ITrtModule` instances,
+   `prefill_` and `decoder_`; this is consistent with each one independently
+   loading its own full copy of the weights onto the GPU rather than sharing
+   one resident copy. That's 1.22 seconds of avoidable-in-principle H2D
+   transfer alone, on every turn, in addition to whatever else engine
+   deserialization and CUDA context setup cost -- a large, previously
+   unquantified piece of the "outside prefill/decode" total in the Results
+   section above.
+2. **Once the two weight uploads finish, the GPU is idle almost the entire
+   rest of the time.** Merging every kernel/copy interval on the GPU
+   timeline: across the *whole* captured run (weight uploads included), the
+   GPU is active 21.5% of the time. Isolating just the window *after* both
+   weight uploads finish -- i.e. prefill and decode proper, the part this
+   README's `prefill_ms`/`decode_ms` numbers describe -- GPU utilization
+   drops to **2.6%: the GPU is idle 97.4% of the time it's supposedly doing
+   prefill and decode.** Corroborating this from a different angle: summing
+   every individual kernel's own execution time across the whole run gives
+   ~34.0 ms of actual GPU compute, against `trtmc`'s own reported
+   `prefill_ms + decode_ms` total of 1004.3 ms for that run -- GPU kernels
+   are running for about 3.4% of what `trtmc` calls "prefill and decode."
+
+Put together: this profile's headline number (`trtmc` at ~18-19% of the
+bandwidth floor) is not because the GPU is doing 18-19%-of-floor-speed *work*
+-- it's because the GPU is compute-idle almost all of the time `trtmc`
+reports as prefill/decode, doing something else (most consistent with
+per-step host-side dispatch/synchronization overhead between the many small
+kernel launches a 42-layer model needs per step, though this profile doesn't
+itself distinguish CPU-side scheduling delay from kernel-launch latency down
+to that level) -- and separately, every invocation pays a large, literal,
+avoidable-looking double weight-upload that has nothing to do with the
+decode loop at all. This is the one item in this README that was profiled
+with `nsys` rather than derived or reasoned about; the rest of the
+`trtmc` internals here (pipeline structure, timing boundaries) were read
+from source, not measured this precisely.
 
 **The native `tool`-role format, read directly from
 `chat_template.jinja`:** `role: "tool"` messages merge consecutive results
@@ -445,13 +552,25 @@ into one `<|im_start|>user...<|im_end|>` block, with `\n` around each
 `<tool_response>...</tool_response>`, only opening/closing that block at a
 run of consecutive tool messages. The shipped code's `role: "user"` +
 manually-wrapped `<tool_response>` produces one such block per call instead.
-A 2-line variant using `role: "tool"` (not shipped; instance-local only) ran
-the real default task once: completed correctly in 4 turns, same A40
-recommendation, no crash, no malformed call. Turn-by-turn prompt token counts
-were close to the shipped format's (within a few dozen tokens either way,
-confounded by the model's own output length differing turn to turn once the
-input format changes). One run each is not enough to say whether either
-format is more reliable -- it says only that the native format also works.
+A 2-line variant using `role: "tool"` (not shipped; instance-local only) was
+tested against the shipped format, 5 runs each, on 2026-09-24 (a different
+A100-SXM4-80GB instance):
+
+| | runs | successes | errors | crashes |
+|---|---|---|---|---|
+| shipped (`role: "user"`) | 5 | 5 | 0 | 0 |
+| native (`role: "tool"`) | 5 | 5 | 0 | 0 |
+
+Both formats: 5/5 correct A40 recommendations, 4 turns every time, zero
+malformed calls, zero errors. Diffing the 5 runs within each format shows
+they're **byte-identical except for the timing lines** -- same turn count,
+same token counts, same generated text, every time (`trtmc` is fully
+deterministic here, consistent with the greedy decoding confirmed in
+Limitations). That makes this a clean comparison rather than 5 independent
+noisy samples: at greedy decoding, on this exact task, both formats are
+perfectly reliable, so there's no reliability gap to measure. It says
+nothing about a harder task, a different checkpoint, or non-greedy
+decoding, where the two formats could still diverge.
 
 ## Task
 
@@ -464,18 +583,23 @@ snippets.
 
 ## Limitations and open questions
 
-- **HF eager and vLLM baselines both exist now (see Further checks); SGLang
-  does not.** `trtmc` is ~1.4x faster than naive HF `generate()` but ~2.3x
-  slower than vLLM with CUDA graphs and `torch.compile` -- a real,
-  commonly-used serving stack beats `trtmc`'s numbers here, though vLLM's
-  number also has no per-turn reload cost (persistent server) while
-  `trtmc`'s real numbers, as used by this agent, do.
-- **The ~13-14 ms/token decode figure is now compared against a
-  memory-bandwidth floor (see Further checks): `trtmc` runs at ~18-19% of
-  it, vLLM ~42%, HF eager ~13%.** That says how far each is from the floor,
-  not which specific mechanism (host launch overhead, no CUDA graphs, other
-  per-step cost) accounts for the gap -- nothing has been profiled, and that
-  still needs GPU access this project doesn't currently have.
+- **HF eager, vLLM, and SGLang baselines all exist now (see Further
+  checks).** `trtmc` is ~1.4x faster than naive HF `generate()` but ~2.3x
+  slower than vLLM and ~2.7x slower than SGLang, both with CUDA graphs --
+  two real, commonly-used serving stacks both beat `trtmc`'s numbers here,
+  though neither has `trtmc`'s per-turn reload cost (both are persistent
+  servers) while `trtmc`'s real numbers, as used by this agent, do.
+- **The ~13-14 ms/token decode figure has been compared against a
+  memory-bandwidth floor and profiled directly with `nsys` (see Further
+  checks): `trtmc` runs at ~18-19% of the floor, but that's not because the
+  GPU is computing slowly -- profiling shows the GPU is idle 97.4% of the
+  time inside `trtmc`'s own reported prefill+decode window.** The dominant,
+  now-quantified mechanism is per-step host-side overhead between kernel
+  launches, not GPU compute throughput; a separate, also-newly-found
+  mechanism is that `trtmc` uploads the full model to the GPU *twice* per
+  invocation (1.22s combined, see Further checks). Exactly which fraction of
+  the 97.4% idle time is CPU-side scheduling versus kernel-launch latency
+  specifically is not distinguished at this level of profiling.
 - **`decode_ms / len(token_ids)` has a real, small, two-directional bias --
   resolved by reading `families/llama/runtime/pipeline.cpp`'s
   `generate_from_ids()`/`run_decode_loop()` directly, not by guessing.**
@@ -506,25 +630,36 @@ snippets.
   percent to ~1.6%, well inside the run-to-run variance already reported
   (stdev up to 0.113 ms/token) -- real, now precisely explained, not something that
   changes any conclusion in this README.
-- **Per-turn reload cost is measured and is the dominant cost** (see Results):
-  65% of one run's wall time was outside prefill/decode. A persistent-server
-  runtime, not available for `trtmc` today, would be the fix.
-- **Encode-side parity is checked, broken, root-caused, and reduced to one
-  residual token out of 826** (see "The trtmc findings" above): `trtmc`'s
-  encoder originally produced 851 ids for a prompt HF encodes to 826. The
-  double leading BOS is fixed in `render.py`, shipped in this project
-  (851 -> 850, verified). A `bpe_tokenizer.cpp` patch closing the rest of the
-  gap was written and tested on 2026-09-23 -- a first attempt made things
-  worse (871) before a corrected version got to 825 vs HF's 826 -- but that
-  patch cannot be fixed from this project: it's instance-local only, not
-  filed upstream, and not something this project ships or distributes.
-  Whether the remaining gap changes model behavior, not just token count, is
-  unverified.
+- **Per-turn reload cost is measured, is the dominant cost, and part of it
+  is now precisely identified** (see Results and Further checks): 65% of one
+  run's wall time was outside prefill/decode; `nsys` profiling later found
+  that `trtmc` uploads the full ~4.69 GB model to the GPU *twice* per
+  invocation, 1.22 seconds combined, on every turn. A persistent-server
+  runtime, not available for `trtmc` today, would remove both the reload and
+  the duplicate upload.
+- **Encode-side parity is checked, broken, root-caused, reduced to one
+  residual token out of 826, and shown to actually change model behavior**
+  (see "The trtmc findings" above): `trtmc`'s encoder originally produced 851
+  ids for a prompt HF encodes to 826. The double leading BOS is fixed in
+  `render.py`, shipped in this project (851 -> 850, verified). A
+  `bpe_tokenizer.cpp` patch closing the rest of the gap was written and
+  tested on 2026-09-23 -- a first attempt made things worse (871) before a
+  corrected version got to 825 vs HF's 826 -- but that patch cannot be fixed
+  from this project: it's instance-local only, not filed upstream, and not
+  something this project ships or distributes. Whether the remaining gap
+  changes model behavior, not just token count, *was* unverified; checked
+  directly on 2026-09-24 with a deterministic unpatched-vs-patched
+  comparison (both runs internally reproducible byte-for-byte): yes, on this
+  task, the patched build used less than half the tokens and made more
+  thorough, more directly-verified comparisons, though both reached the same
+  correct answer.
 - **Tool results are formatted as one `user` turn per call**
   (`<tool_response>…</tool_response>`), confirmed to differ from the
-  template's own `tool` role (see Further checks); a single run with the
-  native format also worked, but one run each does not show which is more
-  reliable.
+  template's own `tool` role (see Further checks). Tested 5 runs each on
+  2026-09-24: both formats were 100% reliable (5/5 correct, zero errors) and
+  each was internally deterministic, so there was no reliability gap to
+  measure on this task at greedy decoding -- this says nothing about a
+  harder task or non-greedy decoding.
 - **Sampling parameters are not passed to `trtmc`, and it decodes greedily by
   default.** Confirmed by reading `apps/cli/cli.cpp`'s `dispatch_run()`:
   `config.top_k = int_option(command, "--top-k", 1, 0)` -- default value `1`
@@ -538,11 +673,11 @@ snippets.
 - `web_search` depends on `ddgs`; result quality is outside this project.
 - Sanitization is pattern-based and validated only against HF's tokenizer
   behaviour and `trtmc`'s source, not end to end on a GPU.
-- `precision_compare.py` runs all bf16 invocations before all fp16 ones rather
-  than interleaving them. Each precision has now been built twice (see Further
-  checks): same-precision variance is ~1%, well under the ~4% bf16/fp16 gap,
-  which supports the gap being a real precision effect -- but it is still only
-  two builds per precision, not a distribution.
+- `precision_compare.py` runs all bf16 invocations before all fp16 ones
+  rather than interleaving them. A real distribution now exists (see Further
+  checks): 5 independent builds per precision put the bf16/fp16 gap at about
+  5.2 pooled within-precision standard deviations, well beyond what
+  build-to-build noise (~1% CV) can explain -- a real precision effect.
 - The model has never used the calculator to check the task's own budget
   figure against a price; the current task's budget happens to be satisfied
   by all three cards, so this has not yet mattered to the answer.
@@ -602,11 +737,18 @@ Gotchas hit on rented hardware:
 - NGC images set up CUDA Forward Compatibility only for the entrypoint's own
   process, so a later `docker exec` sees `torch.cuda.is_available() == False`.
   Pass `-e LD_LIBRARY_PATH=/usr/local/cuda/compat/lib` on each `docker exec`
-  that needs the GPU. Not reproduced during the 2026-09-22 verification (which
-  did `docker exec` into a long-lived container repeatedly and never saw
-  `torch.cuda.is_available() == False` from this cause) -- possibly specific
-  to an older image/driver combination than the one used here; listed as a
-  known gotcha, not confirmed against this exact setup.
+  that needs the GPU. Not reproduced on any of the three instances used across
+  this project (most recently checked directly on 2026-09-24, a third
+  A100-SXM4-80GB instance): `docker exec`'s own `$LD_LIBRARY_PATH` genuinely
+  does *not* include `/usr/local/cuda/compat/lib` (confirmed by printing it),
+  matching the gotcha's premise -- but `trtmc` itself, which needs real CUDA
+  to do anything, has run correctly via `docker exec` on every one of dozens
+  of invocations across this whole project. Likely explanation: the
+  driver on these instances (580.126.09) is new enough for CUDA 13.3 that
+  forward compatibility mode isn't actually engaged, so the missing compat
+  path is never load-bearing here -- consistent with, but not proof of, why
+  this hasn't bitten this project. Kept as a documented gotcha since it's a
+  real, correctly-described mechanism; just not one this project has hit.
 
 ## Run
 
